@@ -4,6 +4,25 @@ import CoreServices
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum FilePathNormalization {
+    /// Stable POSIX paths for index keys, manual edits, and prefix checks (`.` / `..` collapsed, trailing slashes removed).
+    static func canonical(_ path: String) -> String {
+        (path as NSString).standardizingPath
+    }
+
+    static func pathsMatch(_ a: String, _ b: String) -> Bool {
+        canonical(a) == canonical(b)
+    }
+
+    /// Whether `filePath` lies under `libraryRoot`. Root comparison is case-insensitive so enumerator paths still match the folder the user picked on a default APFS/HFS+ install.
+    static func isUnderLibraryRoot(_ filePath: String, libraryRoot: String) -> Bool {
+        let f = canonical(filePath).lowercased()
+        let r = canonical(libraryRoot).lowercased()
+        if f == r { return true }
+        return f.hasPrefix(r + "/")
+    }
+}
+
 @main
 enum LiquidFLACPlayerLauncher {
     @MainActor
@@ -162,11 +181,11 @@ struct LibraryIndex: Codable {
 
     mutating func applyManualEditsForExistingFiles() {
         manualEdits = manualEdits.filter { path, _ in
-            FileManager.default.fileExists(atPath: path)
+            FileManager.default.fileExists(atPath: FilePathNormalization.canonical(path))
         }
 
         for (_, editedTrack) in manualEdits {
-            tracks.removeAll { $0.path == editedTrack.path }
+            tracks.removeAll { FilePathNormalization.pathsMatch($0.path, editedTrack.path) }
             tracks.append(editedTrack)
         }
 
@@ -174,6 +193,32 @@ struct LibraryIndex: Codable {
             lhs.artist.localizedCaseInsensitiveCompare(rhs.artist) == .orderedAscending
                 || (lhs.artist == rhs.artist && lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending)
         }
+    }
+
+    /// Normalize stored paths so manual edits keys always match scanned `IndexedTrack.path` values after reindex.
+    mutating func canonicalizeAllFilePaths() {
+        tracks = tracks.map { entry in
+            IndexedTrack(
+                path: FilePathNormalization.canonical(entry.path),
+                title: entry.title,
+                artist: entry.artist,
+                album: entry.album,
+                genre: entry.genre
+            )
+        }
+        var rebuilt: [String: IndexedTrack] = [:]
+        for (_, edited) in manualEdits {
+            let p = FilePathNormalization.canonical(edited.path)
+            rebuilt[p] = IndexedTrack(
+                path: p,
+                title: edited.title,
+                artist: edited.artist,
+                album: edited.album,
+                genre: edited.genre
+            )
+        }
+        manualEdits = rebuilt
+        roots = roots.map { LibraryRootIndex(path: FilePathNormalization.canonical($0.path), fingerprint: $0.fingerprint) }
     }
 }
 
@@ -267,6 +312,10 @@ actor FileMetadataWriter {
                 let message = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
                 return message.isEmpty ? "metaflac exited with code \(process.terminationStatus)" : message
             }
+            if let verificationError = verifyFLAC(update: update, url: url, metaflac: metaflac) {
+                return verificationError
+            }
+            reimportSpotlightMetadata(for: url)
             return nil
         } catch {
             return error.localizedDescription
@@ -277,6 +326,73 @@ actor FileMetadataWriter {
         guard let value else { return }
         arguments.append("--remove-tag=\(key)")
         arguments.append("--set-tag=\(key)=\(value)")
+    }
+
+    private func verifyFLAC(update: FileMetadataUpdate, url: URL, metaflac: String) -> String? {
+        let expected = [
+            "TITLE": update.title,
+            "ARTIST": update.artist,
+            "ALBUM": update.album,
+            "GENRE": update.genre
+        ].compactMapValues { $0 }
+
+        guard !expected.isEmpty else { return nil }
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: metaflac)
+        process.arguments = expected.keys.sorted().map { "--show-tag=\($0)" } + [url.path]
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                return "could not verify written metadata"
+            }
+
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let text = String(decoding: data, as: UTF8.self)
+            let actual = parseVorbisTags(text)
+
+            for (key, expectedValue) in expected {
+                if actual[key] != expectedValue {
+                    return "metadata verification failed for \(key)"
+                }
+            }
+            return nil
+        } catch {
+            return "could not verify written metadata: \(error.localizedDescription)"
+        }
+    }
+
+    private func parseVorbisTags(_ text: String) -> [String: String] {
+        var tags: [String: String] = [:]
+
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            tags[key] = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return tags
+    }
+
+    private func reimportSpotlightMetadata(for url: URL) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/mdimport")
+        process.arguments = [url.path]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            // The file tags are already written; Spotlight refresh is best-effort.
+        }
     }
 
     private func findExecutable(named name: String) -> String? {
@@ -529,6 +645,7 @@ actor ArtworkProvider {
 
 actor LibraryIndexer {
     private let fileManager = FileManager.default
+    private var highestSaveGeneration: UInt64 = 0
     private let audioExtensions: Set<String> = [
         "flac", "mp3", "m4a", "aac", "aiff", "aif", "wav", "alac", "ogg", "opus"
     ]
@@ -539,7 +656,12 @@ actor LibraryIndexer {
         return try? JSONDecoder().decode(LibraryIndex.self, from: data)
     }
 
-    func saveIndex(_ index: LibraryIndex) {
+    /// `generation` must increase whenever the in-memory index advances. Older generations are ignored
+    /// so concurrent `persistCurrentIndex` saves cannot roll the JSON file back to stale metadata.
+    func saveIndex(_ index: LibraryIndex, generation: UInt64) {
+        guard generation >= highestSaveGeneration else { return }
+        highestSaveGeneration = generation
+
         let url = indexURL()
         do {
             try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -550,11 +672,12 @@ actor LibraryIndexer {
         }
     }
 
-    func scan(rootPath: String, previousRoot: LibraryRootIndex?) async -> LibraryScanOutcome {
-        let rootURL = URL(fileURLWithPath: rootPath)
+    func scan(rootPath: String, previousRoot: LibraryRootIndex?, forceFullRebuild: Bool = false) async -> LibraryScanOutcome {
+        let canonicalRoot = FilePathNormalization.canonical(rootPath)
+        let rootURL = URL(fileURLWithPath: canonicalRoot)
         let fingerprint = buildFingerprint(for: rootURL)
 
-        if let previousRoot, previousRoot.fingerprint == fingerprint {
+        if !forceFullRebuild, let previousRoot, previousRoot.fingerprint == fingerprint {
             return .skippedUnchanged
         }
 
@@ -566,7 +689,7 @@ actor LibraryIndexer {
             let metadata = await extractMetadata(for: file)
             indexedTracks.append(
                 IndexedTrack(
-                    path: file.path,
+                    path: FilePathNormalization.canonical(file.path),
                     title: metadata.title,
                     artist: metadata.artist,
                     album: metadata.album,
@@ -576,7 +699,7 @@ actor LibraryIndexer {
         }
 
         return .rebuilt(
-            newRootIndex: LibraryRootIndex(path: rootPath, fingerprint: fingerprint),
+            newRootIndex: LibraryRootIndex(path: canonicalRoot, fingerprint: fingerprint),
             tracks: indexedTracks
         )
     }
@@ -634,6 +757,11 @@ actor LibraryIndexer {
     }
 
     private func extractMetadata(for url: URL) async -> (title: String, artist: String, album: String, genre: String) {
+        if url.pathExtension.lowercased() == "flac",
+           let flacMetadata = flacVorbisMetadata(for: url) {
+            return flacMetadata
+        }
+
         let asset = AVURLAsset(url: url)
         let fallbackTitle = url.deletingPathExtension().lastPathComponent
 
@@ -642,42 +770,94 @@ actor LibraryIndexer {
         let finderMetadata = spotlightMetadata(for: url)
 
         let title: String
-        if let finderTitle = finderMetadata.title {
-            title = finderTitle
-        } else if let tagTitle = metadataValue(in: metadataItems, exactKeys: ["title", "tit2", "©nam", "name"], containsKeys: ["title"]) {
+        if let tagTitle = metadataValue(in: metadataItems, exactKeys: ["title", "tit2", "©nam", "name"], containsKeys: ["title"]) {
             title = tagTitle
+        } else if let finderTitle = finderMetadata.title {
+            title = finderTitle
         } else {
             title = fallback.title
         }
 
         let artist: String
-        if let finderArtist = finderMetadata.artist {
-            artist = finderArtist
-        } else if let tagArtist = cleanArtistValue(metadataValue(in: metadataItems, exactKeys: ["artist", "albumartist", "album_artist", "tpe1", "©art"], containsKeys: ["artist", "performer"])) {
+        if let tagArtist = cleanArtistValue(metadataValue(in: metadataItems, exactKeys: ["artist", "albumartist", "album_artist", "tpe1", "©art"], containsKeys: ["artist", "performer"])) {
             artist = tagArtist
+        } else if let finderArtist = finderMetadata.artist {
+            artist = finderArtist
         } else {
             artist = fallback.artist
         }
 
         let album: String
-        if let finderAlbum = finderMetadata.album {
-            album = finderAlbum
-        } else if let tagAlbum = metadataValue(in: metadataItems, exactKeys: ["album", "albumname", "talb", "©alb"], containsKeys: ["album"]) {
+        if let tagAlbum = metadataValue(in: metadataItems, exactKeys: ["album", "albumname", "talb", "©alb"], containsKeys: ["album"]) {
             album = tagAlbum
+        } else if let finderAlbum = finderMetadata.album {
+            album = finderAlbum
         } else {
             album = fallback.album
         }
 
         let genre: String
-        if let finderGenre = finderMetadata.genre {
-            genre = finderGenre
-        } else if let tagGenre = metadataValue(in: metadataItems, exactKeys: ["genre", "tcon", "©gen"], containsKeys: ["genre"]) {
+        if let tagGenre = metadataValue(in: metadataItems, exactKeys: ["genre", "tcon", "©gen"], containsKeys: ["genre"]) {
             genre = tagGenre
+        } else if let finderGenre = finderMetadata.genre {
+            genre = finderGenre
         } else {
             genre = fallback.genre
         }
 
         return (title, artist, album, genre)
+    }
+
+    private func flacVorbisMetadata(for url: URL) -> (title: String, artist: String, album: String, genre: String)? {
+        guard let metaflac = findExecutable(named: "metaflac") else { return nil }
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: metaflac)
+        process.arguments = [
+            "--show-tag=TITLE",
+            "--show-tag=ARTIST",
+            "--show-tag=ALBUM",
+            "--show-tag=GENRE",
+            url.path
+        ]
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let text = String(decoding: data, as: UTF8.self)
+            let tags = parseVorbisTags(text)
+            let fallback = fallbackMetadata(from: url.deletingPathExtension().lastPathComponent)
+
+            return (
+                title: tags["TITLE"] ?? fallback.title,
+                artist: cleanArtistValue(tags["ARTIST"]) ?? fallback.artist,
+                album: tags["ALBUM"] ?? fallback.album,
+                genre: tags["GENRE"] ?? fallback.genre
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    private func parseVorbisTags(_ text: String) -> [String: String] {
+        var tags: [String: String] = [:]
+
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            let value = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { continue }
+            tags[key] = value
+        }
+
+        return tags
     }
 
     private func spotlightMetadata(for url: URL) -> (title: String?, artist: String?, album: String?, genre: String?) {
@@ -797,6 +977,36 @@ actor LibraryIndexer {
         return cleaned
     }
 
+    private func findExecutable(named name: String) -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/\(name)",
+            "/usr/local/bin/\(name)",
+            "/usr/bin/\(name)"
+        ]
+
+        if let match = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            return match
+        }
+
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["which", name]
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let path = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            return path.isEmpty ? nil : path
+        } catch {
+            return nil
+        }
+    }
+
     private func fallbackMetadata(from filename: String) -> (title: String, artist: String, album: String, genre: String) {
         if let separator = filename.range(of: " - ") {
             let artist = String(filename[..<separator.lowerBound]).trimmingCharacters(in: .whitespaces)
@@ -833,6 +1043,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var audioPlayer: AVAudioPlayer?
     private var progressTimer: Timer?
     private var reindexTimer: Timer?
+    private var indexPersistenceGeneration: UInt64 = 0
     private var index = LibraryIndex(version: LibraryIndex.currentVersion, roots: [], tracks: [], updatedAt: .distantPast)
     private let indexer = LibraryIndexer()
     private let artworkProvider = ArtworkProvider()
@@ -899,8 +1110,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
         var added = false
         for url in panel.urls {
-            let path = url.path
-            if !libraryRoots.contains(path) {
+            let path = FilePathNormalization.canonical(url.path)
+            if !libraryRoots.contains(where: { FilePathNormalization.pathsMatch($0, path) }) {
                 libraryRoots.append(path)
                 added = true
             }
@@ -913,13 +1124,14 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func removeLibraryRoot(_ path: String) {
-        libraryRoots.removeAll { $0 == path }
-        index.roots.removeAll { $0.path == path }
+        let root = FilePathNormalization.canonical(path)
+        libraryRoots.removeAll { FilePathNormalization.pathsMatch($0, root) }
+        index.roots.removeAll { FilePathNormalization.pathsMatch($0.path, root) }
         index.tracks.removeAll { track in
-            path == URL(fileURLWithPath: track.path).deletingLastPathComponent().path || track.path.hasPrefix(path + "/")
+            FilePathNormalization.isUnderLibraryRoot(track.path, libraryRoot: root)
         }
         index.manualEdits = index.manualEdits.filter { _, track in
-            !(path == URL(fileURLWithPath: track.path).deletingLastPathComponent().path || track.path.hasPrefix(path + "/"))
+            !FilePathNormalization.isUnderLibraryRoot(track.path, libraryRoot: root)
         }
         applyIndexedTracks(index.tracks)
         persistCurrentIndex()
@@ -1027,16 +1239,17 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
             playlist[index] = updatedTrack
             updatedTracksForDisk.append(updatedTrack)
+            let pathForIndex = FilePathNormalization.canonical(updatedTrack.url.path)
             let indexedTrack = IndexedTrack(
-                path: updatedTrack.url.path,
+                path: pathForIndex,
                 title: updatedTrack.title,
                 artist: updatedTrack.artist,
                 album: updatedTrack.album,
                 genre: updatedTrack.genre
             )
-            self.index.tracks.removeAll { $0.path == updatedTrack.url.path }
+            self.index.tracks.removeAll { FilePathNormalization.pathsMatch($0.path, pathForIndex) }
             self.index.tracks.append(indexedTrack)
-            self.index.manualEdits[updatedTrack.url.path] = indexedTrack
+            self.index.manualEdits[pathForIndex] = indexedTrack
 
             if updatedTrack.url == currentURL {
                 updatedCurrentTrack = updatedTrack
@@ -1204,12 +1417,15 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func loadIndexOnLaunch() async {
         if let existing = await indexer.loadIndex() {
-            libraryRoots = existing.roots.map(\.path)
+            libraryRoots = existing.roots.map { FilePathNormalization.canonical($0.path) }.sorted()
 
             if existing.version == LibraryIndex.currentVersion {
-                index = existing
-                applyIndexedTracks(existing.tracks)
-                indexStatus = "Loaded \(existing.tracks.count) tracks from index"
+                var loadedIndex = existing
+                loadedIndex.canonicalizeAllFilePaths()
+                loadedIndex.applyManualEditsForExistingFiles()
+                index = loadedIndex
+                applyIndexedTracks(loadedIndex.tracks)
+                indexStatus = "Loaded \(loadedIndex.tracks.count) tracks from index"
             } else {
                 index = LibraryIndex(version: LibraryIndex.currentVersion, roots: [], tracks: [], updatedAt: .distantPast)
                 playlist = []
@@ -1221,7 +1437,12 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         scheduleReindex(reason: "Checking for library changes")
     }
 
-    private func scheduleReindex(reason: String) {
+    /// Forces a full metadata read from disk for every library folder (same as a fingerprint miss on all roots).
+    func rescanLibraryFromDisk() {
+        scheduleReindex(reason: "Rescanning library from disk", forceFullRebuild: true)
+    }
+
+    private func scheduleReindex(reason: String, forceFullRebuild: Bool = false) {
         guard !isReindexing else { return }
         guard !libraryRoots.isEmpty else {
             indexStatus = "Add library folders to build your index"
@@ -1239,28 +1460,24 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             var changed = 0
 
             for root in roots {
-                let previous = resultIndex.roots.first { $0.path == root }
-                let outcome = await indexer.scan(rootPath: root, previousRoot: previous)
+                let previous = resultIndex.roots.first { FilePathNormalization.pathsMatch($0.path, root) }
+                let outcome = await indexer.scan(rootPath: root, previousRoot: previous, forceFullRebuild: forceFullRebuild)
 
                 switch outcome {
                 case .skippedUnchanged:
                     continue
                 case let .rebuilt(newRootIndex, tracks):
                     changed += 1
-                    resultIndex.roots.removeAll { $0.path == root }
+                    resultIndex.roots.removeAll { FilePathNormalization.pathsMatch($0.path, root) }
                     resultIndex.roots.append(newRootIndex)
-                    resultIndex.tracks.removeAll { $0.path.hasPrefix(root + "/") }
+                    resultIndex.tracks.removeAll { FilePathNormalization.isUnderLibraryRoot($0.path, libraryRoot: root) }
                     resultIndex.tracks.append(contentsOf: tracks)
                 }
             }
 
-            resultIndex.tracks.sort { lhs, rhs in
-                lhs.artist.localizedCaseInsensitiveCompare(rhs.artist) == .orderedAscending
-                    || (lhs.artist == rhs.artist && lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending)
-            }
-            resultIndex.applyManualEditsForExistingFiles()
-            resultIndex.updatedAt = Date()
-            await indexer.saveIndex(resultIndex)
+            // Do not save here: scans start from a snapshot; saving before merge would write
+            // stale tracks/manualEdits and could race with persistCurrentIndex(), leaving disk
+            // stuck on old metadata. finishReindex merges live manual edits then persists once.
 
             await MainActor.run {
                 self.finishReindex(newIndex: resultIndex, changedRoots: changed)
@@ -1269,8 +1486,15 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func finishReindex(newIndex: LibraryIndex, changedRoots: Int) {
-        index = newIndex
-        applyIndexedTracks(newIndex.tracks)
+        var mergedIndex = newIndex
+        // Reindexing runs from a snapshot. If the user edits metadata while the
+        // scan is in flight, keep the live manual edits instead of the stale scan.
+        mergedIndex.manualEdits.merge(index.manualEdits) { _, liveEdit in liveEdit }
+        mergedIndex.applyManualEditsForExistingFiles()
+
+        index = mergedIndex
+        applyIndexedTracks(mergedIndex.tracks)
+        persistCurrentIndex()
         isReindexing = false
 
         if changedRoots == 0 {
@@ -1305,14 +1529,18 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func persistCurrentIndex() {
+        indexPersistenceGeneration += 1
+        let generation = indexPersistenceGeneration
+
         index.roots = libraryRoots.map { root in
-            index.roots.first(where: { $0.path == root }) ?? LibraryRootIndex(path: root, fingerprint: RootFingerprint(fileCount: 0, latestModificationTime: 0))
+            index.roots.first(where: { FilePathNormalization.pathsMatch($0.path, root) })
+                ?? LibraryRootIndex(path: root, fingerprint: RootFingerprint(fileCount: 0, latestModificationTime: 0))
         }
         index.updatedAt = Date()
 
         let indexToSave = index
         Task.detached(priority: .utility) { [indexer] in
-            await indexer.saveIndex(indexToSave)
+            await indexer.saveIndex(indexToSave, generation: generation)
         }
     }
 }
@@ -1408,7 +1636,9 @@ struct PlayerView: View {
     private var actionToolbar: some View {
         HStack(spacing: 7) {
             toolbarButton("Play Radio", systemImage: "play.fill")
-            smallToolbarButton(systemImage: "gearshape")
+            smallToolbarButton(systemImage: "gearshape") {
+                player.rescanLibraryFromDisk()
+            }
             toolbarButton("Play All", systemImage: "play.fill") {
                 if let first = player.playlist.first {
                     player.selectTrack(first)
@@ -1462,8 +1692,8 @@ struct PlayerView: View {
         .buttonStyle(.plain)
     }
 
-    private func smallToolbarButton(systemImage: String) -> some View {
-        Button {} label: {
+    private func smallToolbarButton(systemImage: String, action: @escaping () -> Void = {}) -> some View {
+        Button(action: action) {
             Image(systemName: systemImage)
                 .font(.system(size: 12))
                 .foregroundStyle(.black.opacity(0.72))
