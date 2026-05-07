@@ -116,50 +116,86 @@ struct UserSettingDropdownOption: Identifiable, Hashable {
 }
 
 struct UserSettings: Codable, Equatable {
-    static let currentVersion = 1
+    static let currentVersion = 4
     @MainActor
     static let fields: [UserSettingField] = [
         .dropdown(name: "libraryGrouping", label: "Group Library By", keyPath: \.libraryGrouping),
         .dropdown(name: "librarySortOption", label: "Sort Songs By", keyPath: \.librarySortOption),
         .slider(name: "volume", label: "Volume", keyPath: \.volume, display: .percent),
+        .slider(name: "fontScale", label: "Font Scale", keyPath: \.fontScale, range: 0.8...1.8, display: .percent),
         .text(name: "username", label: "Your username", keyPath: \.username),
+        .checkbox(name: "lastFMScrobblingEnabled", label: "Enable Last.fm scrobbling", keyPath: \.lastFMScrobblingEnabled),
+        .text(name: "lastFMAPIKey", label: "Last.fm API key", keyPath: \.lastFMAPIKey),
+        .text(name: "lastFMAPISecret", label: "Last.fm API shared secret", keyPath: \.lastFMAPISecret),
+        .text(name: "lastFMSessionKey", label: "Last.fm session key", keyPath: \.lastFMSessionKey),
+        .text(name: "librarySharingPort", label: "LAN sharing port", keyPath: \.librarySharingPort),
     ]
 
     var version: Int
     var volume: Float
+    var fontScale: Float
     var username: String
     var libraryGrouping: LibraryGrouping
     var librarySortOption: LibrarySortOption
+    var lastFMScrobblingEnabled: Bool
+    var lastFMAPIKey: String
+    var lastFMAPISecret: String
+    var lastFMSessionKey: String
+    var librarySharingPort: String
 
     static let `default` = UserSettings(
         version: currentVersion,
         volume: 0.9,
+        fontScale: 1.0,
         username: NSUserName(),
         libraryGrouping: .artist,
-        librarySortOption: .artist
+        librarySortOption: .artist,
+        lastFMScrobblingEnabled: false,
+        lastFMAPIKey: "",
+        lastFMAPISecret: "",
+        lastFMSessionKey: "",
+        librarySharingPort: "43821"
     )
 
     init(
         version: Int,
         volume: Float,
+        fontScale: Float,
         username: String,
         libraryGrouping: LibraryGrouping,
-        librarySortOption: LibrarySortOption
+        librarySortOption: LibrarySortOption,
+        lastFMScrobblingEnabled: Bool,
+        lastFMAPIKey: String,
+        lastFMAPISecret: String,
+        lastFMSessionKey: String,
+        librarySharingPort: String
     ) {
         self.version = version
         self.volume = volume
+        self.fontScale = fontScale
         self.username = username
         self.libraryGrouping = libraryGrouping
         self.librarySortOption = librarySortOption
+        self.lastFMScrobblingEnabled = lastFMScrobblingEnabled
+        self.lastFMAPIKey = lastFMAPIKey
+        self.lastFMAPISecret = lastFMAPISecret
+        self.lastFMSessionKey = lastFMSessionKey
+        self.librarySharingPort = librarySharingPort
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         version = try container.decodeIfPresent(Int.self, forKey: .version) ?? Self.currentVersion
         volume = try container.decodeIfPresent(Float.self, forKey: .volume) ?? Self.default.volume
+        fontScale = try container.decodeIfPresent(Float.self, forKey: .fontScale) ?? Self.default.fontScale
         username = try container.decodeIfPresent(String.self, forKey: .username) ?? Self.default.username
         libraryGrouping = try container.decodeIfPresent(LibraryGrouping.self, forKey: .libraryGrouping) ?? Self.default.libraryGrouping
         librarySortOption = try container.decodeIfPresent(LibrarySortOption.self, forKey: .librarySortOption) ?? Self.default.librarySortOption
+        lastFMScrobblingEnabled = try container.decodeIfPresent(Bool.self, forKey: .lastFMScrobblingEnabled) ?? Self.default.lastFMScrobblingEnabled
+        lastFMAPIKey = try container.decodeIfPresent(String.self, forKey: .lastFMAPIKey) ?? Self.default.lastFMAPIKey
+        lastFMAPISecret = try container.decodeIfPresent(String.self, forKey: .lastFMAPISecret) ?? Self.default.lastFMAPISecret
+        lastFMSessionKey = try container.decodeIfPresent(String.self, forKey: .lastFMSessionKey) ?? Self.default.lastFMSessionKey
+        librarySharingPort = try container.decodeIfPresent(String.self, forKey: .librarySharingPort) ?? Self.default.librarySharingPort
     }
 
     mutating func migrateIfNeeded() {
@@ -202,7 +238,7 @@ final class UserSettingsStore {
             return nil
         }
         return appSupport
-            .appendingPathComponent("LiquidFLACPlayer", isDirectory: true)
+            .appendingPathComponent("GrooveShark", isDirectory: true)
             .appendingPathComponent("user-settings.json", isDirectory: false)
     }
 }

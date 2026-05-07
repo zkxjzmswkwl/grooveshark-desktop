@@ -110,7 +110,7 @@ final class AlbumArtworkIndexStore {
             return nil
         }
         return appSupport
-            .appendingPathComponent("LiquidFLACPlayer", isDirectory: true)
+            .appendingPathComponent("GrooveShark", isDirectory: true)
             .appendingPathComponent("album-artwork-map.json", isDirectory: false)
     }
 }

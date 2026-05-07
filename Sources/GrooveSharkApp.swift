@@ -5,7 +5,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 @main
-enum LiquidFLACPlayerLauncher {
+enum GrooveSharkLauncher {
     @MainActor
     private static let delegate = DesktopAppDelegate()
 
@@ -21,8 +21,13 @@ enum LiquidFLACPlayerLauncher {
 private final class DesktopAppDelegate: NSObject, NSApplicationDelegate {
     private let player = PlayerViewModel()
     private var window: NSWindow?
+    @objc private func openSettingsFromMenu(_ sender: Any?) {
+        player.isShowingSettings = true
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        configureMenu()
+
         let contentView = PlayerView()
             .environmentObject(player)
             .frame(minWidth: 980, minHeight: 620)
@@ -33,7 +38,7 @@ private final class DesktopAppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "Grooveshark"
+        window.title = "GrooveShark"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false
@@ -46,5 +51,35 @@ private final class DesktopAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    private func configureMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+
+        let appMenu = NSMenu()
+        let appName = ProcessInfo.processInfo.processName
+
+        let settingsItem = NSMenuItem(
+            title: "Settings...",
+            action: #selector(openSettingsFromMenu(_:)),
+            keyEquivalent: ","
+        )
+        settingsItem.keyEquivalentModifierMask = [.command]
+        settingsItem.target = self
+        appMenu.addItem(settingsItem)
+        appMenu.addItem(.separator())
+        appMenu.addItem(
+            NSMenuItem(
+                title: "Quit \(appName)",
+                action: #selector(NSApplication.terminate(_:)),
+                keyEquivalent: "q"
+            )
+        )
+
+        appMenuItem.submenu = appMenu
+        NSApp.mainMenu = mainMenu
     }
 }

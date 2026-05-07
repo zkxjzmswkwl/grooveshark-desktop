@@ -1,8 +1,6 @@
 import Foundation
 
-struct PlayCountStore {
-    static let secondsRequiredForOnePlay: TimeInterval = 30
-
+struct PlaylistStore {
     private let encoder: JSONEncoder = {
         let e = JSONEncoder()
         e.outputFormatting = [.sortedKeys]
@@ -11,22 +9,24 @@ struct PlayCountStore {
 
     private let decoder = JSONDecoder()
 
-    func load() -> [String: Int] {
+    func load() -> [SavedPlaylist] {
         guard let url = storageURL(),
               FileManager.default.fileExists(atPath: url.path),
               let data = try? Data(contentsOf: url),
-              let decoded = try? decoder.decode([String: Int].self, from: data)
+              var decoded = try? decoder.decode(PlaylistLibrary.self, from: data)
         else {
-            return [:]
+            return []
         }
-        return decoded
+        decoded.migrateIfNeeded()
+        return decoded.playlists
     }
 
-    func save(_ counts: [String: Int]) {
+    func save(_ playlists: [SavedPlaylist]) {
         guard let url = storageURL() else { return }
         let dir = url.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        guard let data = try? encoder.encode(counts) else { return }
+        let payload = PlaylistLibrary(playlists: playlists)
+        guard let data = try? encoder.encode(payload) else { return }
         try? data.write(to: url, options: [.atomic])
     }
 
@@ -37,6 +37,6 @@ struct PlayCountStore {
         }
         return appSupport
             .appendingPathComponent("GrooveShark", isDirectory: true)
-            .appendingPathComponent("play-counts.json", isDirectory: false)
+            .appendingPathComponent("playlists.json", isDirectory: false)
     }
 }

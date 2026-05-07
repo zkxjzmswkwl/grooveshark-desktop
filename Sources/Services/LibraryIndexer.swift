@@ -52,7 +52,8 @@ actor LibraryIndexer {
                     title: metadata.title,
                     artist: metadata.artist,
                     album: metadata.album,
-                    genre: metadata.genre
+                    genre: metadata.genre,
+                    trackNumber: metadata.trackNumber
                 )
             )
         }
@@ -67,7 +68,7 @@ actor LibraryIndexer {
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
         return appSupport
-            .appendingPathComponent("LiquidFLACPlayer", isDirectory: true)
+            .appendingPathComponent("GrooveShark", isDirectory: true)
             .appendingPathComponent("library-index.json", isDirectory: false)
     }
 
@@ -115,7 +116,7 @@ actor LibraryIndexer {
         return RootFingerprint(fileCount: fileCount, latestModificationTime: latestDate.timeIntervalSince1970)
     }
 
-    private func extractMetadata(for url: URL) async -> (title: String, artist: String, album: String, genre: String) {
+    private func extractMetadata(for url: URL) async -> (title: String, artist: String, album: String, genre: String, trackNumber: Int?) {
         if url.pathExtension.lowercased() == "flac",
            let flacMetadata = flacVorbisMetadata(for: url) {
             return flacMetadata
@@ -164,10 +165,12 @@ actor LibraryIndexer {
             genre = fallback.genre
         }
 
-        return (title, artist, album, genre)
+        let trackNumber = metadataTrackNumber(in: metadataItems) ?? finderMetadata.trackNumber
+
+        return (title, artist, album, genre, trackNumber)
     }
 
-    private func flacVorbisMetadata(for url: URL) -> (title: String, artist: String, album: String, genre: String)? {
+    private func flacVorbisMetadata(for url: URL) -> (title: String, artist: String, album: String, genre: String, trackNumber: Int?)? {
         guard let metaflac = findExecutable(named: "metaflac") else { return nil }
 
         let process = Process()
@@ -197,7 +200,8 @@ actor LibraryIndexer {
                 title: tags["TITLE"] ?? fallback.title,
                 artist: cleanArtistValue(tags["ARTIST"]) ?? fallback.artist,
                 album: tags["ALBUM"] ?? fallback.album,
-                genre: tags["GENRE"] ?? fallback.genre
+                genre: tags["GENRE"] ?? fallback.genre,
+                trackNumber: parseTrackNumber(tags["TRACKNUMBER"])
             )
         } catch {
             return nil
@@ -219,9 +223,9 @@ actor LibraryIndexer {
         return tags
     }
 
-    private func spotlightMetadata(for url: URL) -> (title: String?, artist: String?, album: String?, genre: String?) {
+    private func spotlightMetadata(for url: URL) -> (title: String?, artist: String?, album: String?, genre: String?, trackNumber: Int?) {
         guard let item = MDItemCreate(kCFAllocatorDefault, url.path as CFString) else {
-            return (nil, nil, nil, nil)
+            return (nil, nil, nil, nil, nil)
         }
 
         let title = mdString(item, kMDItemTitle)
@@ -230,12 +234,14 @@ actor LibraryIndexer {
         let artist = cleanArtistValue(authors) ?? cleanArtistValue(performers)
         let album = mdString(item, kMDItemAlbum)
         let genre = mdString(item, kMDItemMusicalGenre)
+        let trackNumber = mdInt(item, kMDItemAudioTrackNumber)
 
         return (
             title: title,
             artist: artist,
             album: album,
-            genre: genre
+            genre: genre,
+            trackNumber: trackNumber
         )
     }
 
@@ -248,6 +254,21 @@ actor LibraryIndexer {
 
         if let strings = value as? [String] {
             return cleanMetadataString(strings.joined(separator: ", "))
+        }
+
+        return nil
+    }
+
+    private func mdInt(_ item: MDItem, _ attribute: CFString) -> Int? {
+        guard let value = MDItemCopyAttribute(item, attribute) else { return nil }
+
+        if let number = value as? NSNumber {
+            let intValue = number.intValue
+            return intValue > 0 ? intValue : nil
+        }
+
+        if let string = value as? String {
+            return parseTrackNumber(string)
         }
 
         return nil
@@ -276,6 +297,26 @@ actor LibraryIndexer {
                 continue
             }
             return value
+        }
+
+        return nil
+    }
+
+    private func metadataTrackNumber(in items: [AVMetadataItem]) -> Int? {
+        for item in items {
+            let keys = metadataKeys(for: item)
+            guard keys.contains(where: isTrackNumberKey) else { continue }
+
+            if let number = item.numberValue {
+                let intValue = number.intValue
+                if intValue > 0 {
+                    return intValue
+                }
+            }
+
+            if let parsed = parseTrackNumber(item.stringValue) {
+                return parsed
+            }
         }
 
         return nil
@@ -334,6 +375,15 @@ actor LibraryIndexer {
             return nil
         }
         return cleaned
+    }
+
+    private func parseTrackNumber(_ value: String?) -> Int? {
+        guard let cleaned = cleanMetadataString(value) else { return nil }
+
+        let leadingPart = cleaned.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init) ?? cleaned
+        let digits = leadingPart.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsed = Int(digits), parsed > 0 else { return nil }
+        return parsed
     }
 
     private func findExecutable(named name: String) -> String? {

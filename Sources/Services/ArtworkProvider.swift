@@ -10,7 +10,7 @@ actor ArtworkProvider {
             fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
         return appSupport
-            .appendingPathComponent("LiquidFLACPlayer/artwork/by-album", isDirectory: true)
+            .appendingPathComponent("GrooveShark/artwork/by-album", isDirectory: true)
     }
 
     func artworkData(for track: Track) async -> Data? {
@@ -63,7 +63,7 @@ actor ArtworkProvider {
 
         do {
             var request = URLRequest(url: artworkURL)
-            request.setValue("mplayer/0.1 (local macOS player)", forHTTPHeaderField: "User-Agent")
+            request.setValue("GrooveShark/0.1 (local macOS player)", forHTTPHeaderField: "User-Agent")
             let (data, response) = try await URLSession.shared.data(for: request)
             if let httpResponse = response as? HTTPURLResponse,
                !(200..<300).contains(httpResponse.statusCode) {

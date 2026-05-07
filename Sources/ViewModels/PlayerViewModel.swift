@@ -6,7 +6,13 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
-    @Published var playlist: [Track] = []
+    @Published var playlist: [Track] = [] {
+        didSet { applySearchFilter() }
+    }
+    @Published var searchQuery = "" {
+        didSet { applySearchFilter() }
+    }
+    @Published private(set) var filteredPlaylist: [Track] = []
     @Published var currentIndex: Int?
     @Published var isPlaying = false
     @Published var duration: TimeInterval = 1
@@ -14,6 +20,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private var userSettings = UserSettings.default
     @Published var errorMessage: String?
     @Published var libraryRoots: [String] = []
+    @Published private(set) var savedPlaylists: [SavedPlaylist] = []
+    @Published var selectedPlaylistID: SavedPlaylist.ID?
 
     var volume: Float {
         get { userSettings.volume }
@@ -38,6 +46,14 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var isReindexing = false
     @Published var artworkImage: NSImage?
     @Published var isRefreshingArtwork = false
+    @Published var isShowingSettings = false
+    @Published var isAuthorizingLastFM = false
+    @Published var isSharingLibrary = false
+    @Published var isDownloadingSharedLibrary = false
+    @Published var librarySharingStatus = "Library sharing is off"
+    @Published var librarySharingAddress = ""
+    @Published private(set) var sharingTransferSnapshot: LibraryTransferQueueSnapshot = .empty
+    @Published private(set) var downloadTransferSnapshot: LibraryTransferQueueSnapshot = .empty
 
     /// `AlbumArtworkIdentity` key for `artworkImage`; avoids refetch when switching tracks on the same album.
     private var loadedArtworkAlbumKey: String?
@@ -45,6 +61,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var audioPlayer: AVAudioPlayer?
     private var progressTimer: Timer?
     private var reindexTimer: Timer?
+    private var sharingTransferTimer: Timer?
     private var indexPersistenceGeneration: UInt64 = 0
     private var index = LibraryIndex(version: LibraryIndex.currentVersion, roots: [], tracks: [], updatedAt: .distantPast)
     private let indexer = LibraryIndexer()
@@ -52,22 +69,141 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private let fileMetadataWriter = FileMetadataWriter()
     private let userSettingsStore = UserSettingsStore()
     private let playCountStore = PlayCountStore()
+    private let playlistStore = PlaylistStore()
+    private let lastFMScrobbler = LastFMScrobbler()
+    private let librarySharingService = LibrarySharingService()
+    private let librarySharingClient = LibrarySharingClient()
     @Published private(set) var playCounts: [String: Int] = [:]
+    private var libraryCatalog: [Track] = []
 
     private var listenedSecondsThisTrack: TimeInterval = 0
     private var playbackTickAnchor: Date?
     private var creditedPlayForCurrentTrackLoad = false
+    private var playbackStartedAtForCurrentTrack: Date?
+    private var sentNowPlayingForCurrentTrackLoad = false
+    private var submittedScrobbleForCurrentTrackLoad = false
 
     override init() {
         super.init()
+        applySearchFilter()
         playCounts = playCountStore.load()
+        savedPlaylists = playlistStore.load().sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
         applyLoadedUserSettings(userSettingsStore.load())
         Task { await loadIndexOnLaunch() }
         startReindexScheduler()
     }
 
+    deinit {
+        Task { [librarySharingService] in
+            await librarySharingService.stop()
+        }
+    }
+
     var currentUserSettings: UserSettings {
         userSettings
+    }
+
+    var canBeginLastFMAuthorization: Bool {
+        !userSettings.lastFMAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var canShareLibrary: Bool {
+        !libraryCatalog.isEmpty
+    }
+
+    private var lastFMCredentials: LastFMCredentials? {
+        guard userSettings.lastFMScrobblingEnabled else { return nil }
+        let apiKey = userSettings.lastFMAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apiSecret = userSettings.lastFMAPISecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionKey = userSettings.lastFMSessionKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty, !apiSecret.isEmpty, !sessionKey.isEmpty else { return nil }
+        return LastFMCredentials(apiKey: apiKey, apiSecret: apiSecret, sessionKey: sessionKey)
+    }
+
+    func beginLastFMAuthorization() {
+        let apiKey = userSettings.lastFMAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let apiSecret = userSettings.lastFMAPISecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty, !apiSecret.isEmpty else {
+            errorMessage = "Enter your Last.fm API key and shared secret before connecting."
+            return
+        }
+        guard !isAuthorizingLastFM else { return }
+        isAuthorizingLastFM = true
+
+        Task { [lastFMScrobbler] in
+            do {
+                let token = try await lastFMScrobbler.fetchAuthorizationToken(apiKey: apiKey)
+                let authURL = try Self.makeLastFMAuthorizationURL(apiKey: apiKey, token: token)
+                await MainActor.run {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(token, forType: .string)
+
+                    if NSWorkspace.shared.open(authURL) {
+                        self.errorMessage = "Opened Last.fm authorization. Waiting for approval..."
+                    } else {
+                        self.errorMessage = "Got Last.fm token, but could not open browser. Token copied to clipboard."
+                    }
+                }
+
+                let session = try await waitForLastFMSession(
+                    token: token,
+                    apiKey: apiKey,
+                    apiSecret: apiSecret,
+                    scrobbler: lastFMScrobbler
+                )
+
+                await MainActor.run {
+                    self.updateUserSettings { settings in
+                        settings.lastFMSessionKey = session.key
+                        settings.lastFMScrobblingEnabled = true
+                        if settings.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            settings.username = session.name
+                        }
+                    }
+                    self.errorMessage = "Connected Last.fm as \(session.name). Scrobbling is enabled."
+                    self.isAuthorizingLastFM = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorMessage = error.localizedDescription
+                    self.isAuthorizingLastFM = false
+                }
+            }
+        }
+    }
+
+    private func waitForLastFMSession(
+        token: String,
+        apiKey: String,
+        apiSecret: String,
+        scrobbler: LastFMScrobbler
+    ) async throws -> LastFMSession {
+        let attempts = 60
+        for attempt in 0..<attempts {
+            do {
+                return try await scrobbler.fetchSession(apiKey: apiKey, apiSecret: apiSecret, token: token)
+            } catch let LastFMError.api(code, _) where code == 14 {
+                if attempt < attempts - 1 {
+                    try await Task.sleep(for: .seconds(2))
+                    continue
+                }
+            }
+        }
+        throw LastFMError.api(code: 14, message: "Authorization timed out. Approve in browser and try again.")
+    }
+
+    private static func makeLastFMAuthorizationURL(apiKey: String, token: String) throws -> URL {
+        var components = URLComponents(string: "https://www.last.fm/api/auth/")!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "token", value: token),
+        ]
+        guard let url = components.url else {
+            throw LastFMError.invalidRequest
+        }
+        return url
     }
 
     private func applyLoadedUserSettings(_ settings: UserSettings) {
@@ -104,6 +240,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func applyUserSettings(_ settings: UserSettings, persist: Bool) {
         let previousSortOption = userSettings.librarySortOption
+        let previousSharingPort = userSettings.librarySharingPort
         var settings = settings
         settings.version = UserSettings.currentVersion
 
@@ -111,7 +248,12 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         audioPlayer?.volume = settings.volume
 
         if previousSortOption != settings.librarySortOption {
-            sortPlaylistPreservingCurrentTrack()
+            rebuildDisplayedPlaylist()
+        }
+
+        if previousSharingPort != settings.librarySharingPort, isSharingLibrary {
+            stopLibrarySharing()
+            startLibrarySharing()
         }
 
         if persist {
@@ -123,6 +265,22 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         guard let currentIndex else { return nil }
         guard playlist.indices.contains(currentIndex) else { return nil }
         return playlist[currentIndex]
+    }
+
+    var hasActiveSearch: Bool {
+        !normalizedSearchQuery.isEmpty
+    }
+
+    var isViewingSavedPlaylist: Bool {
+        selectedPlaylistID != nil
+    }
+
+    var selectedPlaylistName: String {
+        guard let selectedPlaylistID,
+              let playlist = savedPlaylists.first(where: { $0.id == selectedPlaylistID }) else {
+            return "All Songs"
+        }
+        return playlist.name
     }
 
     func playCount(for track: Track) -> Int {
@@ -156,14 +314,13 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             return
         }
 
-        if playlist.isEmpty {
-            playlist = tracks
-            sortPlaylistPreservingCurrentTrack()
+        let shouldAutoPlayFirstTrack = playlist.isEmpty && currentTrack == nil
+        mergeTracksIntoLibraryCatalog(tracks)
+        rebuildDisplayedPlaylist()
+
+        if shouldAutoPlayFirstTrack, !playlist.isEmpty {
             loadTrack(at: 0)
             play()
-        } else {
-            playlist.append(contentsOf: tracks)
-            sortPlaylistPreservingCurrentTrack()
         }
     }
 
@@ -205,6 +362,243 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         persistCurrentIndex()
     }
 
+    func startLibrarySharing() {
+        guard !isSharingLibrary else { return }
+        guard !libraryCatalog.isEmpty else {
+            errorMessage = "Add songs before starting library sharing."
+            return
+        }
+
+        let rawPort = userSettings.librarySharingPort.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let port = UInt16(rawPort), (1024 ... 65535).contains(port) else {
+            errorMessage = LibrarySharingError.invalidPort.localizedDescription
+            return
+        }
+
+        librarySharingStatus = "Starting library sharing..."
+        sharingTransferSnapshot = .empty
+
+        let tracks = libraryCatalog
+        let roots = libraryRoots
+        Task { [librarySharingService] in
+            do {
+                let endpoint = try await librarySharingService.start(port: port, tracks: tracks, roots: roots)
+                await MainActor.run {
+                    self.isSharingLibrary = true
+                    self.librarySharingAddress = endpoint
+                    self.updateLibrarySharingStatusLine()
+                    self.indexStatus = "Library sharing is active"
+                    self.startSharingTransferPolling()
+                }
+            } catch {
+                await MainActor.run {
+                    self.isSharingLibrary = false
+                    self.librarySharingAddress = ""
+                    self.librarySharingStatus = "Library sharing is off"
+                    self.errorMessage = "Could not start sharing: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func stopLibrarySharing() {
+        guard isSharingLibrary else { return }
+        Task { [librarySharingService] in
+            await librarySharingService.stop()
+            await MainActor.run {
+                self.isSharingLibrary = false
+                self.librarySharingAddress = ""
+                self.librarySharingStatus = "Library sharing is off"
+                self.sharingTransferSnapshot = .empty
+                self.indexStatus = "Stopped library sharing"
+                self.stopSharingTransferPolling()
+            }
+        }
+    }
+
+    func copyLibrarySharingAddressToClipboard() {
+        guard !librarySharingAddress.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(librarySharingAddress, forType: .string)
+        indexStatus = "Copied share address"
+    }
+
+    func promptToDownloadSharedLibrary() {
+        guard !isDownloadingSharedLibrary else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Download Shared Library"
+        alert.informativeText = "Enter the address from the other user, for example 192.168.1.42:43821."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Download")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.placeholderString = "host:port"
+        field.stringValue = "192.168.1.42:\(userSettings.librarySharingPort)"
+        alert.accessoryView = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let address = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !address.isEmpty else {
+            errorMessage = "Enter an address to download from."
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.title = "Choose where to save the downloaded library"
+        panel.prompt = "Choose Folder"
+
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        downloadSharedLibrary(from: address, destinationRoot: destination)
+    }
+
+    private func downloadSharedLibrary(from address: String, destinationRoot: URL) {
+        guard !isDownloadingSharedLibrary else { return }
+        isDownloadingSharedLibrary = true
+        downloadTransferSnapshot = .empty
+        indexStatus = "Downloading shared library..."
+
+        Task { [librarySharingClient] in
+            do {
+                let result = try await librarySharingClient.downloadLibrary(
+                    from: address,
+                    to: destinationRoot
+                ) { snapshot in
+                    await MainActor.run {
+                        self.downloadTransferSnapshot = snapshot
+                    }
+                }
+                await MainActor.run {
+                    self.isDownloadingSharedLibrary = false
+                    let importedPath = FilePathNormalization.canonical(result.importedRoot.path)
+                    if !self.libraryRoots.contains(where: { FilePathNormalization.pathsMatch($0, importedPath) }) {
+                        self.libraryRoots.append(importedPath)
+                        self.libraryRoots.sort()
+                    }
+                    self.indexStatus = "Downloaded \(result.downloadedTracks) tracks from \(address)"
+                    self.scheduleReindex(reason: "Indexing downloaded shared library", forceFullRebuild: true)
+                }
+            } catch {
+                await MainActor.run {
+                    self.isDownloadingSharedLibrary = false
+                    self.errorMessage = "Download failed: \(error.localizedDescription)"
+                    self.indexStatus = "Shared library download failed"
+                }
+            }
+        }
+    }
+
+    func selectPlaylist(_ playlistID: SavedPlaylist.ID?) {
+        selectedPlaylistID = playlistID
+        rebuildDisplayedPlaylist()
+    }
+
+    func promptToCreatePlaylist(with tracks: [Track]) {
+        let uniquePaths = Array(Set(tracks.map { canonicalTrackPath(for: $0) })).sorted()
+        guard !uniquePaths.isEmpty else {
+            errorMessage = "Select one or more songs to create a playlist."
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Create Playlist"
+        alert.informativeText = "Choose a name for your new playlist."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.placeholderString = "Playlist name"
+        field.stringValue = "New Playlist"
+        alert.accessoryView = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            errorMessage = "Playlist name cannot be empty."
+            return
+        }
+
+        if savedPlaylists.contains(where: { $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame }) {
+            errorMessage = "A playlist named \"\(name)\" already exists."
+            return
+        }
+
+        let playlist = SavedPlaylist(name: name, trackPaths: uniquePaths)
+        savedPlaylists.append(playlist)
+        sortAndPersistPlaylists()
+        selectedPlaylistID = playlist.id
+        rebuildDisplayedPlaylist()
+    }
+
+    func addTracksToSelectedPlaylist(_ tracks: [Track]) {
+        guard let selectedPlaylistID,
+              let index = savedPlaylists.firstIndex(where: { $0.id == selectedPlaylistID }) else {
+            errorMessage = "Select a playlist first."
+            return
+        }
+
+        let additions = Set(tracks.map { canonicalTrackPath(for: $0) })
+        guard !additions.isEmpty else { return }
+
+        let existing = Set(savedPlaylists[index].trackPaths.map(FilePathNormalization.canonical))
+        let merged = Array(existing.union(additions)).sorted()
+        savedPlaylists[index].trackPaths = merged
+        savedPlaylists[index].updatedAt = Date()
+        sortAndPersistPlaylists()
+        rebuildDisplayedPlaylist()
+    }
+
+    func addTracks(_ tracks: [Track], to playlistID: SavedPlaylist.ID) {
+        guard let index = savedPlaylists.firstIndex(where: { $0.id == playlistID }) else {
+            errorMessage = "Playlist could not be found."
+            return
+        }
+
+        let additions = Set(tracks.map { canonicalTrackPath(for: $0) })
+        guard !additions.isEmpty else {
+            errorMessage = "Select one or more songs to add."
+            return
+        }
+
+        let existing = Set(savedPlaylists[index].trackPaths.map(FilePathNormalization.canonical))
+        let merged = Array(existing.union(additions)).sorted()
+        savedPlaylists[index].trackPaths = merged
+        savedPlaylists[index].updatedAt = Date()
+        sortAndPersistPlaylists()
+        rebuildDisplayedPlaylist()
+    }
+
+    func removeTracksFromSelectedPlaylist(_ tracks: [Track]) {
+        guard let selectedPlaylistID,
+              let index = savedPlaylists.firstIndex(where: { $0.id == selectedPlaylistID }) else {
+            return
+        }
+
+        let removals = Set(tracks.map { canonicalTrackPath(for: $0) })
+        guard !removals.isEmpty else { return }
+
+        savedPlaylists[index].trackPaths.removeAll { removals.contains(FilePathNormalization.canonical($0)) }
+        savedPlaylists[index].updatedAt = Date()
+        sortAndPersistPlaylists()
+        rebuildDisplayedPlaylist()
+    }
+
+    func deletePlaylist(_ playlist: SavedPlaylist) {
+        savedPlaylists.removeAll { $0.id == playlist.id }
+        if selectedPlaylistID == playlist.id {
+            selectedPlaylistID = nil
+        }
+        sortAndPersistPlaylists()
+        rebuildDisplayedPlaylist()
+    }
+
     func playPause() {
         isPlaying ? pause() : play()
     }
@@ -217,9 +611,13 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             }
             return
         }
+        if playbackStartedAtForCurrentTrack == nil {
+            playbackStartedAtForCurrentTrack = Date()
+        }
         audioPlayer.play()
         isPlaying = true
         startProgressTimer()
+        submitNowPlayingIfNeeded()
     }
 
     func pause() {
@@ -297,8 +695,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         var updatedTracksForDisk: [Track] = []
         let fileUpdate = FileMetadataUpdate(title: title, artist: artist, album: album, genre: genre)
 
-        for index in playlist.indices {
-            let original = playlist[index]
+        for index in libraryCatalog.indices {
+            let original = libraryCatalog[index]
             guard urls.contains(original.url) else { continue }
 
             let updatedTrack = Track(
@@ -306,10 +704,11 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 title: title.map { cleaned($0, fallback: original.title) } ?? original.title,
                 artist: artist.map { cleaned($0, fallback: original.artist) } ?? original.artist,
                 album: album.map { cleaned($0, fallback: original.album) } ?? original.album,
-                genre: genre.map { cleaned($0, fallback: original.genre) } ?? original.genre
+                genre: genre.map { cleaned($0, fallback: original.genre) } ?? original.genre,
+                trackNumber: original.trackNumber
             )
 
-            playlist[index] = updatedTrack
+            libraryCatalog[index] = updatedTrack
             updatedTracksForDisk.append(updatedTrack)
             let pathForIndex = FilePathNormalization.canonical(updatedTrack.url.path)
             let indexedTrack = IndexedTrack(
@@ -317,7 +716,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 title: updatedTrack.title,
                 artist: updatedTrack.artist,
                 album: updatedTrack.album,
-                genre: updatedTrack.genre
+                genre: updatedTrack.genre,
+                trackNumber: updatedTrack.trackNumber
             )
             self.index.tracks.removeAll { FilePathNormalization.pathsMatch($0.path, pathForIndex) }
             self.index.tracks.append(indexedTrack)
@@ -333,11 +733,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 || (lhs.artist == rhs.artist && lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending)
         }
 
-        sortPlaylistPreservingCurrentTrack()
-        if let currentURL,
-           let newIndex = playlist.firstIndex(where: { $0.url == currentURL }) {
-            currentIndex = newIndex
-        }
+        rebuildDisplayedPlaylist()
         persistCurrentIndex()
         writeMetadataToFiles(update: fileUpdate, tracks: updatedTracksForDisk)
         if let updatedCurrentTrack {
@@ -355,6 +751,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         guard playlist.indices.contains(index) else { return }
         let track = playlist[index]
         resetPlayCountSessionState()
+        resetScrobbleSessionState()
         do {
             let player = try AVAudioPlayer(contentsOf: track.url)
             player.delegate = self
@@ -384,23 +781,199 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    private func sortPlaylistPreservingCurrentTrack() {
+    private var normalizedSearchQuery: String {
+        searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func applySearchFilter() {
+        let query = normalizedSearchQuery
+        guard !query.isEmpty else {
+            filteredPlaylist = playlist
+            return
+        }
+
+        filteredPlaylist = playlist.filter { track in
+            trackMatchesSearch(track, query: query)
+        }
+    }
+
+    private func trackMatchesSearch(_ track: Track, query: String) -> Bool {
+        let fields = [
+            track.title,
+            track.artist,
+            track.album,
+            track.genre,
+            track.url.deletingPathExtension().lastPathComponent
+        ]
+        return fields.contains {
+            $0.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+        }
+    }
+
+    private func rebuildDisplayedPlaylist() {
         let currentURL = currentTrack?.url
-        playlist.sort { lhs, rhs in
+        let visibleTracks = tracksForSelectedPlaylist()
+        playlist = sortedTracks(visibleTracks)
+
+        if let currentURL,
+           let index = playlist.firstIndex(where: { $0.url == currentURL }) {
+            currentIndex = index
+        } else if playlist.isEmpty {
+            currentIndex = nil
+            pause()
+        } else if currentIndex == nil || !playlist.indices.contains(currentIndex ?? -1) {
+            currentIndex = 0
+        }
+    }
+
+    private func sortedTracks(_ tracks: [Track]) -> [Track] {
+        tracks.sorted { lhs, rhs in
             switch sortOption {
             case .title:
                 return compare(lhs.title, rhs.title, fallback: lhs.artist, rhs.artist)
             case .artist:
                 return compare(lhs.artist, rhs.artist, fallback: lhs.title, rhs.title)
             case .album:
-                return compare(lhs.album, rhs.album, fallback: lhs.title, rhs.title)
+                return compareAlbumTracks(lhs, rhs)
             case .genre:
                 return compare(lhs.genre, rhs.genre, fallback: lhs.artist, rhs.artist)
             }
         }
-        if let currentURL,
-           let index = playlist.firstIndex(where: { $0.url == currentURL }) {
-            currentIndex = index
+    }
+
+    private func tracksForSelectedPlaylist() -> [Track] {
+        guard let selectedPlaylistID,
+              let saved = savedPlaylists.first(where: { $0.id == selectedPlaylistID }) else {
+            return libraryCatalog
+        }
+        let pathSet = Set(saved.trackPaths.map(FilePathNormalization.canonical))
+        return libraryCatalog.filter { pathSet.contains(canonicalTrackPath(for: $0)) }
+    }
+
+    private func mergeTracksIntoLibraryCatalog(_ tracks: [Track]) {
+        var mergedByPath: [String: Track] = Dictionary(
+            uniqueKeysWithValues: libraryCatalog.map { (canonicalTrackPath(for: $0), $0) }
+        )
+        for track in tracks {
+            mergedByPath[canonicalTrackPath(for: track)] = track
+        }
+        libraryCatalog = Array(mergedByPath.values)
+        refreshLibrarySharingSnapshotIfNeeded()
+    }
+
+    private func canonicalTrackPath(for track: Track) -> String {
+        FilePathNormalization.canonical(track.url.path)
+    }
+
+    private func refreshLibrarySharingSnapshotIfNeeded() {
+        guard isSharingLibrary else { return }
+        let tracks = libraryCatalog
+        let roots = libraryRoots
+        Task { [librarySharingService] in
+            await librarySharingService.updateSharedLibrary(tracks: tracks, roots: roots)
+            let snapshot = await librarySharingService.sharingTransferSnapshot()
+            await MainActor.run {
+                self.sharingTransferSnapshot = snapshot
+                self.updateLibrarySharingStatusLine()
+            }
+        }
+    }
+
+    private func pollSharingTransferState() {
+        guard isSharingLibrary else { return }
+        Task { [librarySharingService] in
+            let snapshot = await librarySharingService.sharingTransferSnapshot()
+            await MainActor.run {
+                self.sharingTransferSnapshot = snapshot
+                self.updateLibrarySharingStatusLine()
+            }
+        }
+    }
+
+    private func startSharingTransferPolling() {
+        sharingTransferTimer?.invalidate()
+        sharingTransferTimer = Timer.scheduledTimer(
+            withTimeInterval: 0.6,
+            repeats: true
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.pollSharingTransferState()
+            }
+        }
+        pollSharingTransferState()
+    }
+
+    private func stopSharingTransferPolling() {
+        sharingTransferTimer?.invalidate()
+        sharingTransferTimer = nil
+    }
+
+    private func updateLibrarySharingStatusLine() {
+        guard isSharingLibrary else {
+            librarySharingStatus = "Library sharing is off"
+            return
+        }
+
+        let currentlyServing = sharingTransferSnapshot.current.count
+        let served = sharingTransferSnapshot.completed.count
+        let total = sharingTransferSnapshot.completed.count
+            + sharingTransferSnapshot.current.count
+            + sharingTransferSnapshot.upcoming.count
+        if currentlyServing > 0 {
+            librarySharingStatus = "Sharing \(total) tracks on \(librarySharingAddress) (\(served) served, \(currentlyServing) serving now)"
+        } else {
+            librarySharingStatus = "Sharing \(total) tracks on \(librarySharingAddress) (\(served) served)"
+        }
+    }
+
+    private func sortAndPersistPlaylists() {
+        savedPlaylists.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        playlistStore.save(savedPlaylists)
+    }
+
+    private func cleanupPlaylistsForAvailableTracks() {
+        let availablePaths = Set(libraryCatalog.map(canonicalTrackPath(for:)))
+        var changed = false
+
+        for index in savedPlaylists.indices {
+            let before = savedPlaylists[index].trackPaths
+            let after = before.filter { availablePaths.contains(FilePathNormalization.canonical($0)) }
+            if before != after {
+                savedPlaylists[index].trackPaths = after
+                savedPlaylists[index].updatedAt = Date()
+                changed = true
+            }
+        }
+
+        if changed {
+            sortAndPersistPlaylists()
+        }
+    }
+
+    private func compareAlbumTracks(_ lhs: Track, _ rhs: Track) -> Bool {
+        let primary = lhs.album.localizedCaseInsensitiveCompare(rhs.album)
+        if primary != .orderedSame {
+            return primary == .orderedAscending
+        }
+
+        if let byTrackNumber = compareTrackNumbers(lhs.trackNumber, rhs.trackNumber) {
+            return byTrackNumber
+        }
+
+        return compare(lhs.title, rhs.title, fallback: lhs.artist, rhs.artist)
+    }
+
+    private func compareTrackNumbers(_ lhs: Int?, _ rhs: Int?) -> Bool? {
+        switch (lhs, rhs) {
+        case let (left?, right?) where left != right:
+            return left < right
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            return nil
         }
     }
 
@@ -474,11 +1047,11 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             let artist = String(filename[..<separator.lowerBound]).trimmingCharacters(in: .whitespaces)
             let title = String(filename[separator.upperBound...]).trimmingCharacters(in: .whitespaces)
             if !artist.isEmpty && !title.isEmpty {
-                return Track(url: url, title: title, artist: artist, album: "Unknown Album", genre: "Unknown Genre")
+                return Track(url: url, title: title, artist: artist, album: "Unknown Album", genre: "Unknown Genre", trackNumber: nil)
             }
         }
 
-        return Track(url: url, title: filename, artist: "Unknown Artist", album: "Unknown Album", genre: "Unknown Genre")
+        return Track(url: url, title: filename, artist: "Unknown Artist", album: "Unknown Album", genre: "Unknown Genre", trackNumber: nil)
     }
 
     private func startProgressTimer() {
@@ -497,6 +1070,12 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         creditedPlayForCurrentTrackLoad = false
     }
 
+    private func resetScrobbleSessionState() {
+        playbackStartedAtForCurrentTrack = nil
+        sentNowPlayingForCurrentTrackLoad = false
+        submittedScrobbleForCurrentTrackLoad = false
+    }
+
     private func recordPlayIfEligible() {
         guard !creditedPlayForCurrentTrackLoad,
               listenedSecondsThisTrack >= PlayCountStore.secondsRequiredForOnePlay,
@@ -506,6 +1085,60 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         let path = FilePathNormalization.canonical(track.url.path)
         playCounts[path] = (playCounts[path] ?? 0) + 1
         playCountStore.save(playCounts)
+    }
+
+    private func submitNowPlayingIfNeeded() {
+        guard !sentNowPlayingForCurrentTrackLoad,
+              let credentials = lastFMCredentials,
+              let track = currentTrack,
+              let audioPlayer
+        else { return }
+
+        sentNowPlayingForCurrentTrackLoad = true
+        let trackDuration = audioPlayer.duration
+
+        Task { [lastFMScrobbler] in
+            do {
+                try await lastFMScrobbler.updateNowPlaying(
+                    credentials: credentials,
+                    track: track,
+                    duration: trackDuration
+                )
+            } catch {
+                await MainActor.run {
+                    self.errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func submitScrobbleIfEligible() {
+        guard !submittedScrobbleForCurrentTrackLoad,
+              let credentials = lastFMCredentials,
+              let track = currentTrack,
+              let startedAt = playbackStartedAtForCurrentTrack,
+              let audioPlayer
+        else { return }
+
+        let trackDuration = max(audioPlayer.duration, 0)
+        let threshold = max(30, min(trackDuration * 0.5, 240))
+        guard listenedSecondsThisTrack >= threshold else { return }
+
+        submittedScrobbleForCurrentTrackLoad = true
+        Task { [lastFMScrobbler] in
+            do {
+                try await lastFMScrobbler.scrobble(
+                    credentials: credentials,
+                    track: track,
+                    startedAt: startedAt,
+                    duration: trackDuration
+                )
+            } catch {
+                await MainActor.run {
+                    self.errorMessage = error.localizedDescription
+                }
+            }
+        }
     }
 
     @objc private func refreshProgress() {
@@ -520,6 +1153,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
         currentTime = audioPlayer.currentTime
         duration = max(audioPlayer.duration, 1)
+        submitScrobbleIfEligible()
     }
 
     private func startReindexScheduler() {
@@ -544,8 +1178,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 indexStatus = "Loaded \(loadedIndex.tracks.count) tracks from index"
             } else {
                 index = LibraryIndex(version: LibraryIndex.currentVersion, roots: [], tracks: [], updatedAt: .distantPast)
-                playlist = []
-                currentIndex = nil
+                libraryCatalog = []
+                rebuildDisplayedPlaylist()
                 indexStatus = "Metadata index upgraded; rebuilding library"
             }
         }
@@ -621,27 +1255,19 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func applyIndexedTracks(_ entries: [IndexedTrack]) {
-        let currentURL = currentTrack?.url
-        playlist = entries.map {
+        libraryCatalog = entries.map {
             Track(
                 url: URL(fileURLWithPath: $0.path),
                 title: $0.title,
                 artist: $0.artist,
                 album: $0.album,
-                genre: $0.genre
+                genre: $0.genre,
+                trackNumber: $0.trackNumber
             )
         }
-        sortPlaylistPreservingCurrentTrack()
-
-        if let currentURL,
-           let newIndex = playlist.firstIndex(where: { $0.url == currentURL }) {
-            currentIndex = newIndex
-        } else if playlist.isEmpty {
-            currentIndex = nil
-            pause()
-        } else if currentIndex == nil {
-            currentIndex = 0
-        }
+        cleanupPlaylistsForAvailableTracks()
+        rebuildDisplayedPlaylist()
+        refreshLibrarySharingSnapshotIfNeeded()
     }
 
     private func persistCurrentIndex() {

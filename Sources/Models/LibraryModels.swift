@@ -7,6 +7,7 @@ struct Track: Identifiable, Equatable, Hashable {
     let artist: String
     let album: String
     let genre: String
+    let trackNumber: Int?
 }
 
 enum LibraryGrouping: String, CaseIterable, Identifiable, Codable {
@@ -32,6 +33,40 @@ struct LibraryGroup: Identifiable {
     let tracks: [Track]
 }
 
+struct SavedPlaylist: Identifiable, Codable, Equatable {
+    let id: UUID
+    var name: String
+    var trackPaths: [String]
+    var createdAt: Date
+    var updatedAt: Date
+
+    init(id: UUID = UUID(), name: String, trackPaths: [String], createdAt: Date = Date(), updatedAt: Date = Date()) {
+        self.id = id
+        self.name = name
+        self.trackPaths = trackPaths
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+struct PlaylistLibrary: Codable {
+    static let currentVersion = 1
+
+    var version: Int
+    var playlists: [SavedPlaylist]
+
+    static let `default` = PlaylistLibrary(version: currentVersion, playlists: [])
+
+    init(version: Int = PlaylistLibrary.currentVersion, playlists: [SavedPlaylist]) {
+        self.version = version
+        self.playlists = playlists
+    }
+
+    mutating func migrateIfNeeded() {
+        version = Self.currentVersion
+    }
+}
+
 struct MetadataEditSession: Identifiable {
     let id = UUID()
     let tracks: [Track]
@@ -50,13 +85,15 @@ struct IndexedTrack: Codable {
     let artist: String
     let album: String
     let genre: String
+    let trackNumber: Int?
 
-    init(path: String, title: String, artist: String, album: String, genre: String) {
+    init(path: String, title: String, artist: String, album: String, genre: String, trackNumber: Int? = nil) {
         self.path = path
         self.title = title
         self.artist = artist
         self.album = album
         self.genre = genre
+        self.trackNumber = trackNumber
     }
 
     init(from decoder: Decoder) throws {
@@ -66,6 +103,7 @@ struct IndexedTrack: Codable {
         artist = try container.decode(String.self, forKey: .artist)
         album = try container.decodeIfPresent(String.self, forKey: .album) ?? "Unknown Album"
         genre = try container.decode(String.self, forKey: .genre)
+        trackNumber = try container.decodeIfPresent(Int.self, forKey: .trackNumber)
     }
 }
 
@@ -80,7 +118,7 @@ struct LibraryRootIndex: Codable {
 }
 
 struct LibraryIndex: Codable {
-    static let currentVersion = 3
+    static let currentVersion = 4
 
     let version: Int
     var roots: [LibraryRootIndex]
@@ -135,7 +173,8 @@ struct LibraryIndex: Codable {
                 title: entry.title,
                 artist: entry.artist,
                 album: entry.album,
-                genre: entry.genre
+                genre: entry.genre,
+                trackNumber: entry.trackNumber
             )
         }
         var rebuilt: [String: IndexedTrack] = [:]
@@ -146,7 +185,8 @@ struct LibraryIndex: Codable {
                 title: edited.title,
                 artist: edited.artist,
                 album: edited.album,
-                genre: edited.genre
+                genre: edited.genre,
+                trackNumber: edited.trackNumber
             )
         }
         roots = roots.map { LibraryRootIndex(path: FilePathNormalization.canonical($0.path), fingerprint: $0.fingerprint) }
