@@ -7,6 +7,13 @@ struct PlayerView: View {
         let position: CGPoint
     }
 
+    private enum SidebarDock: CaseIterable {
+        case top
+        case right
+        case bottom
+        case left
+    }
+
     @EnvironmentObject private var player: PlayerViewModel
     @State private var editingSession: MetadataEditSession?
     @State private var selectedTrackIDs: Set<Track.ID> = []
@@ -14,6 +21,10 @@ struct PlayerView: View {
     @State private var containerSize: CGSize = .zero
     @State private var containerFrameInWindow: CGRect = .zero
     @State private var songContextMenuSize: CGSize = CGSize(width: 230, height: 160)
+    @State private var sidebarDock: SidebarDock = .left
+
+    private let sidebarWidth: CGFloat = 188
+    private let sidebarTopBottomHeight: CGFloat = 256
 
     var body: some View {
         VStack(spacing: 0) {
@@ -82,6 +93,7 @@ struct PlayerView: View {
             }
         }
         .appFontScale(CGFloat(player.currentUserSettings.fontScale))
+        .preferredColorScheme(player.darkModeEnabled ? .dark : .light)
     }
 
     private var groovesharkNav: some View {
@@ -133,7 +145,7 @@ struct PlayerView: View {
                     TextField("Search", text: $player.searchQuery)
                         .textFieldStyle(.plain)
                         .appFont(size: 12)
-                        .foregroundStyle(.black.opacity(0.8))
+                        .foregroundStyle(Color.grooveTextPrimary.opacity(0.85))
                         .disableAutocorrection(true)
                     if !player.searchQuery.isEmpty {
                         Button {
@@ -147,7 +159,7 @@ struct PlayerView: View {
                 }
                 .padding(.horizontal, 8)
                 .frame(width: 180, height: 22)
-                .background(Color.white, in: RoundedRectangle(cornerRadius: 11))
+                .background(Color.grooveSurfaceRaised, in: RoundedRectangle(cornerRadius: 11))
             }
             .padding(.trailing, 9)
         }
@@ -209,7 +221,7 @@ struct PlayerView: View {
         .padding(.horizontal, 8)
         .frame(height: 32)
         .background(
-            LinearGradient(colors: [Color.white, Color(red: 0.83, green: 0.84, blue: 0.86)], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Color.grooveSurfaceRaised, Color.grooveSurfaceSecondary], startPoint: .top, endPoint: .bottom)
         )
         .overlay(alignment: .bottom) { Rectangle().fill(Color.black.opacity(0.25)).frame(height: 1) }
     }
@@ -222,12 +234,12 @@ struct PlayerView: View {
                 Text(title)
             }
             .appFont(size: 12, weight: .semibold)
-            .foregroundStyle(.black.opacity(0.78))
+            .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
             .padding(.horizontal, 9)
             .frame(height: 22)
-            .background(LinearGradient(colors: [Color.white, Color(red: 0.80, green: 0.81, blue: 0.83)], startPoint: .top, endPoint: .bottom))
+            .background(LinearGradient(colors: [Color.grooveSurfaceRaised, Color.grooveSurfaceSecondary], startPoint: .top, endPoint: .bottom))
             .clipShape(RoundedRectangle(cornerRadius: 3))
-            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black.opacity(0.25), lineWidth: 1))
+            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.grooveBorder, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
@@ -255,12 +267,12 @@ struct PlayerView: View {
                     .appFont(size: 9, weight: .bold)
             }
             .appFont(size: 12, weight: .semibold)
-            .foregroundStyle(.black.opacity(0.78))
+            .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
             .padding(.horizontal, 9)
             .frame(height: 22)
-            .background(LinearGradient(colors: [Color.white, Color(red: 0.80, green: 0.81, blue: 0.83)], startPoint: .top, endPoint: .bottom))
+            .background(LinearGradient(colors: [Color.grooveSurfaceRaised, Color.grooveSurfaceSecondary], startPoint: .top, endPoint: .bottom))
             .clipShape(RoundedRectangle(cornerRadius: 3))
-            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black.opacity(0.25), lineWidth: 1))
+            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.grooveBorder, lineWidth: 1))
         }
         .menuStyle(.borderlessButton)
         .disabled(playlistActionTracks.isEmpty)
@@ -352,139 +364,255 @@ struct PlayerView: View {
     }
 
     private var contentArea: some View {
-        HStack(spacing: 0) {
-            sidebar
-            songTable
+        Group {
+            switch sidebarDock {
+            case .left:
+                HStack(spacing: 0) {
+                    sidebarSidePanel
+                    songTable
+                }
+            case .right:
+                HStack(spacing: 0) {
+                    songTable
+                    sidebarSidePanel
+                }
+            case .top:
+                VStack(spacing: 0) {
+                    sidebarTopBottomRow
+                    songTable
+                }
+            case .bottom:
+                VStack(spacing: 0) {
+                    songTable
+                    sidebarTopBottomRow
+                }
+            }
         }
     }
 
-    private var sidebar: some View {
+    private var sidebarSidePanel: some View {
+        VStack(spacing: 0) {
+            sidebarContent
+            Spacer(minLength: 0)
+        }
+            .frame(width: sidebarWidth)
+            .frame(maxHeight: .infinity, alignment: .top)
+            .background(Color.grooveSurface)
+            .overlay(alignment: sidebarDock == .left ? .trailing : .leading) {
+                Rectangle().fill(Color.grooveBorder).frame(width: 1)
+            }
+            .overlay(alignment: .topTrailing) {
+                dockHandle
+            }
+            .contentShape(Rectangle())
+            .gesture(sidebarDragGesture)
+    }
+
+    private var sidebarTopBottomRow: some View {
+        sidebarTopBottomContent
+            .frame(maxWidth: .infinity)
+            .frame(height: sidebarTopBottomHeight)
+            .background(Color.grooveSurface)
+            .overlay(
+                Rectangle().fill(Color.grooveBorder).frame(height: 1),
+                alignment: sidebarDock == .top ? .bottom : .top
+            )
+            .overlay(alignment: .topTrailing) {
+                dockHandle
+            }
+            .contentShape(Rectangle())
+            .gesture(sidebarDragGesture)
+    }
+
+    private var sidebarContent: some View {
         VStack(alignment: .leading, spacing: 0) {
             albumArt
                 .padding(.horizontal, 10)
                 .padding(.top, 10)
 
-            Text(player.currentTrack?.artist ?? selectedSidebarArtist)
-                .appFont(size: 15, weight: .bold)
-                .foregroundStyle(.black.opacity(0.85))
-                .lineLimit(1)
+            sidebarPrimaryControls
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
 
-            // Button {
-            //     player.addLibraryFolders()
-            // } label: {
-            //     Label("Follow", systemImage: "plus")
-            //         .font(.system(size: 12, weight: .semibold))
-            //         .foregroundStyle(.black.opacity(0.78))
-            //         .padding(.horizontal, 8)
-            //         .frame(height: 22)
-            //         .background(Color.white)
-            //         .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color.black.opacity(0.25), lineWidth: 1))
-            // }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 12)
-            .padding(.top, 7)
+            playlistsSection
+                .padding(.horizontal, 12)
+                .padding(.top, 13)
+
+            libraryFoldersSection
+                .padding(12)
+        }
+    }
+
+    private var sidebarTopBottomContent: some View {
+        HStack(alignment: .top, spacing: 12) {
+            albumArt
+                .frame(width: 188, height: 188)
+                .padding(.leading, 10)
+                .padding(.top, 10)
+
+            VStack(alignment: .leading, spacing: 10) {
+                sidebarPrimaryControls
+                Spacer(minLength: 0)
+            }
+            .frame(width: 220, alignment: .topLeading)
+            .padding(.top, 10)
+
+            ScrollView {
+                HStack(alignment: .top, spacing: 20) {
+                    playlistsSection
+                        .frame(width: 260, alignment: .topLeading)
+                    libraryFoldersSection
+                        .frame(width: 260, alignment: .topLeading)
+                }
+                .padding(.top, 10)
+                .padding(.trailing, 16)
+            }
+        }
+    }
+
+    private var sidebarPrimaryControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(player.currentTrack?.artist ?? selectedSidebarArtist)
+                .appFont(size: 15, weight: .bold)
+                .foregroundStyle(Color.grooveTextPrimary.opacity(0.92))
+                .lineLimit(1)
 
             Button {
                 player.forceRefreshArtwork()
             } label: {
                 Label(player.isRefreshingArtwork ? "Refreshing Art" : "Refresh Art", systemImage: "arrow.clockwise")
                     .appFont(size: 12, weight: .semibold)
-                    .foregroundStyle(.black.opacity(0.78))
+                    .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
                     .padding(.horizontal, 8)
                     .frame(height: 22)
-                    .background(Color.white)
-                    .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color.black.opacity(0.25), lineWidth: 1))
+                    .background(Color.grooveSurfaceRaised)
+                    .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color.grooveBorder, lineWidth: 1))
             }
             .buttonStyle(.plain)
             .disabled(player.currentTrack == nil || player.isRefreshingArtwork)
-            .padding(.horizontal, 12)
-            .padding(.top, 6)
 
             Button {
                 openMetadataEditor()
             } label: {
                 Label(editMetadataTitle, systemImage: "pencil")
                     .appFont(size: 12, weight: .semibold)
-                    .foregroundStyle(.black.opacity(0.78))
+                    .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
                     .padding(.horizontal, 8)
                     .frame(height: 22)
-                    .background(Color.white)
-                    .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color.black.opacity(0.25), lineWidth: 1))
+                    .background(Color.grooveSurfaceRaised)
+                    .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color.grooveBorder, lineWidth: 1))
             }
             .buttonStyle(.plain)
             .disabled(metadataEditTracks.isEmpty)
-            .padding(.horizontal, 12)
-            .padding(.top, 6)
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Playlists")
-                    .appFont(size: 12, weight: .bold)
-                    .foregroundStyle(.black.opacity(0.70))
-
-                playlistRow(
-                    title: "All Songs",
-                    systemImage: "music.note.list",
-                    isSelected: player.selectedPlaylistID == nil
-                ) {
-                    player.selectPlaylist(nil)
-                }
-
-                ForEach(player.savedPlaylists) { playlist in
-                    HStack(spacing: 4) {
-                        playlistRow(
-                            title: playlist.name,
-                            systemImage: "music.note",
-                            isSelected: player.selectedPlaylistID == playlist.id
-                        ) {
-                            player.selectPlaylist(playlist.id)
-                        }
-
-                        Button {
-                            player.deletePlaylist(playlist)
-                            selectedTrackIDs.removeAll()
-                        } label: {
-                            Image(systemName: "trash")
-                                .appFont(size: 10, weight: .semibold)
-                                .foregroundStyle(.black.opacity(0.45))
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 13)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Library Folders")
-                    .appFont(size: 12, weight: .bold)
-                    .foregroundStyle(.black.opacity(0.70))
-                    .padding(.bottom, 3)
-                if player.libraryRoots.isEmpty {
-                    Text("Add folders like Music or Downloads/Music.")
-                        .foregroundStyle(Color.gray)
-                } else {
-                    ForEach(player.libraryRoots, id: \.self) { root in
-                        Button {
-                            player.removeLibraryRoot(root)
-                        } label: {
-                            Text(URL(fileURLWithPath: root).lastPathComponent)
-                                .lineLimit(1)
-                                .foregroundStyle(Color.grooveOrange)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .appFont(size: 12, weight: .semibold)
-            .padding(12)
-
-            Spacer()
         }
-        .frame(width: 188)
-        .background(Color(red: 0.89, green: 0.90, blue: 0.89))
-        .overlay(alignment: .trailing) { Rectangle().fill(Color.black.opacity(0.22)).frame(width: 1) }
+    }
+
+    private var playlistsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Playlists")
+                .appFont(size: 12, weight: .bold)
+                .foregroundStyle(Color.grooveTextSecondary)
+
+            playlistRow(
+                title: "All Songs",
+                systemImage: "music.note.list",
+                isSelected: player.selectedPlaylistID == nil
+            ) {
+                player.selectPlaylist(nil)
+            }
+
+            ForEach(player.savedPlaylists) { playlist in
+                HStack(spacing: 4) {
+                    playlistRow(
+                        title: playlist.name,
+                        systemImage: "music.note",
+                        isSelected: player.selectedPlaylistID == playlist.id
+                    ) {
+                        player.selectPlaylist(playlist.id)
+                    }
+
+                    Button {
+                        player.deletePlaylist(playlist)
+                        selectedTrackIDs.removeAll()
+                    } label: {
+                        Image(systemName: "trash")
+                            .appFont(size: 10, weight: .semibold)
+                            .foregroundStyle(Color.grooveTextSecondary.opacity(0.85))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var libraryFoldersSection: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("Library Folders")
+                .appFont(size: 12, weight: .bold)
+                .foregroundStyle(Color.grooveTextSecondary)
+                .padding(.bottom, 3)
+            if player.libraryRoots.isEmpty {
+                Text("Add folders like Music or Downloads/Music.")
+                    .foregroundStyle(Color.grooveTextSecondary)
+            } else {
+                ForEach(player.libraryRoots, id: \.self) { root in
+                    Button {
+                        player.removeLibraryRoot(root)
+                    } label: {
+                        Text(URL(fileURLWithPath: root).lastPathComponent)
+                            .lineLimit(1)
+                            .foregroundStyle(Color.grooveOrange)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .appFont(size: 12, weight: .semibold)
+    }
+
+    private var dockHandle: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+            Text("Drag to dock")
+        }
+        .appFont(size: 10, weight: .semibold)
+        .foregroundStyle(Color.grooveTextSecondary)
+        .padding(.horizontal, 8)
+        .frame(height: 18)
+        .background(Color.grooveSurfaceRaised.opacity(0.9))
+        .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.grooveBorder, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 3))
+        .padding(6)
+    }
+
+    private var sidebarDragGesture: some Gesture {
+        DragGesture(minimumDistance: 18)
+            .onEnded { value in
+                sidebarDock = nearestDock(for: value.translation)
+            }
+    }
+
+    private func nearestDock(for translation: CGSize) -> SidebarDock {
+        let origin: CGPoint
+        switch sidebarDock {
+        case .left:
+            origin = CGPoint(x: 0, y: containerSize.height * 0.5)
+        case .right:
+            origin = CGPoint(x: containerSize.width, y: containerSize.height * 0.5)
+        case .top:
+            origin = CGPoint(x: containerSize.width * 0.5, y: 0)
+        case .bottom:
+            origin = CGPoint(x: containerSize.width * 0.5, y: containerSize.height)
+        }
+
+        let projected = CGPoint(x: origin.x + translation.width, y: origin.y + translation.height)
+        let distances: [(SidebarDock, CGFloat)] = [
+            (.left, projected.x),
+            (.right, max(0, containerSize.width - projected.x)),
+            (.top, projected.y),
+            (.bottom, max(0, containerSize.height - projected.y)),
+        ]
+        return distances.min(by: { $0.1 < $1.1 })?.0 ?? sidebarDock
     }
 
     private var selectedSidebarArtist: String {
@@ -523,7 +651,7 @@ struct PlayerView: View {
 
     private var albumArt: some View {
         ZStack(alignment: .bottomLeading) {
-            Color(red: 0.12, green: 0.12, blue: 0.13)
+            Color.black.opacity(0.92)
             Group {
                 if let image = player.artworkImage {
                     Image(nsImage: image)
@@ -532,7 +660,7 @@ struct PlayerView: View {
                         .scaledToFit()
                 } else {
                     LinearGradient(
-                        colors: [Color(red: 0.16, green: 0.19, blue: 0.20), Color(red: 0.66, green: 0.68, blue: 0.58)],
+                        colors: [Color.black.opacity(0.90), Color.grooveSurfaceSecondary],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
@@ -553,7 +681,7 @@ struct PlayerView: View {
         .aspectRatio(1, contentMode: .fit)
         .frame(maxWidth: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 2))
-        .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color.black.opacity(0.35), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color.grooveBorder, lineWidth: 1))
     }
 
     private func playlistRow(title: String, systemImage: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
@@ -566,7 +694,7 @@ struct PlayerView: View {
                 Spacer()
             }
             .appFont(size: 12, weight: isSelected ? .bold : .regular)
-            .foregroundStyle(isSelected ? .white : Color.black.opacity(0.66))
+            .foregroundStyle(isSelected ? .white : Color.grooveTextPrimary.opacity(0.84))
             .padding(.horizontal, 8)
             .frame(height: 24)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -597,7 +725,7 @@ struct PlayerView: View {
                     .buttonStyle(.borderedProminent)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.white)
+                .background(Color.grooveSurfaceRaised)
             } else if player.filteredPlaylist.isEmpty {
                 VStack(spacing: 10) {
                     Text("No matching songs")
@@ -613,7 +741,7 @@ struct PlayerView: View {
                     .buttonStyle(.bordered)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.white)
+                .background(Color.grooveSurfaceRaised)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
@@ -622,7 +750,7 @@ struct PlayerView: View {
                         }
                     }
                 }
-                .background(Color.white)
+                .background(Color.grooveSurfaceRaised)
             }
 
             HStack {
@@ -635,9 +763,9 @@ struct PlayerView: View {
             .appFont(size: 12)
             .padding(.horizontal, 12)
             .frame(height: 28)
-            .background(Color(red: 0.92, green: 0.92, blue: 0.92))
+            .background(Color.grooveSurfaceSecondary)
         }
-        .background(Color.white)
+        .background(Color.grooveSurfaceRaised)
     }
 
     private var songCountLabel: String {
@@ -655,16 +783,20 @@ struct PlayerView: View {
             sortHeader("Artist", option: .artist)
                 .frame(width: 220, alignment: .leading)
             sortHeader("Album", option: .album)
-                .frame(width: 212, alignment: .leading)
+                .frame(width: player.showFidelityColumn ? 156 : 212, alignment: .leading)
+            if player.showFidelityColumn {
+                Text("Fidelity")
+                    .frame(width: 86, alignment: .trailing)
+            }
             Text("Plays")
                 .frame(width: 48, alignment: .trailing)
         }
         .appFont(size: 12, weight: .bold)
-        .foregroundStyle(.black.opacity(0.68))
+        .foregroundStyle(Color.grooveTextSecondary)
         .padding(.leading, 18)
         .padding(.trailing, 10)
         .frame(height: 25)
-        .background(Color(red: 0.95, green: 0.95, blue: 0.95))
+        .background(Color.grooveSurfaceSecondary)
         .overlay(alignment: .bottom) { Rectangle().fill(Color.black.opacity(0.13)).frame(height: 1) }
     }
 
@@ -702,14 +834,21 @@ struct PlayerView: View {
 
             Text(track.album)
                 .lineLimit(1)
-                .frame(width: 212, alignment: .leading)
+                .frame(width: player.showFidelityColumn ? 156 : 212, alignment: .leading)
+
+            if player.showFidelityColumn {
+                Text(track.fidelityLabel)
+                    .lineLimit(1)
+                    .frame(width: 86, alignment: .trailing)
+                    .foregroundStyle(Color.grooveTextSecondary)
+            }
 
             Text("\(player.playCount(for: track))")
                 .lineLimit(1)
                 .frame(width: 48, alignment: .trailing)
         }
         .appFont(size: 12)
-        .foregroundStyle(.black.opacity(0.72))
+        .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
         .padding(.leading, 18)
         .padding(.trailing, 10)
         .frame(height: 26)
@@ -771,7 +910,7 @@ struct PlayerView: View {
         if isSelected {
             return Color.grooveOrange.opacity(0.28)
         }
-        return index.isMultiple(of: 2) ? Color.white : Color(red: 0.965, green: 0.965, blue: 0.965)
+        return index.isMultiple(of: 2) ? Color.grooveSurfaceRaised : Color.grooveRowAlternate
     }
 
     private func toggleSelection(_ track: Track) {

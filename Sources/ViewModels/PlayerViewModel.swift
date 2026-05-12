@@ -33,6 +33,16 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         set { updateUserSetting(\.username, to: newValue) }
     }
 
+    var darkModeEnabled: Bool {
+        get { userSettings.darkModeEnabled }
+        set { updateUserSetting(\.darkModeEnabled, to: newValue) }
+    }
+
+    var showFidelityColumn: Bool {
+        get { userSettings.showFidelityColumn }
+        set { updateUserSetting(\.showFidelityColumn, to: newValue) }
+    }
+
     var libraryGrouping: LibraryGrouping {
         get { userSettings.libraryGrouping }
         set { updateUserSetting(\.libraryGrouping, to: newValue) }
@@ -599,6 +609,115 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         rebuildDisplayedPlaylist()
     }
 
+    func executePlaylistScript(_ script: String) -> String {
+        let lines = script
+            .components(separatedBy: .newlines)
+            .enumerated()
+            .compactMap { index, rawLine -> (Int, String)? in
+                let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty, !trimmed.hasPrefix("--") else { return nil }
+                return (index + 1, trimmed)
+            }
+
+        guard !lines.isEmpty else {
+            return "No commands to run."
+        }
+
+        var output: [String] = []
+        var successCount = 0
+
+        for (lineNumber, line) in lines {
+            do {
+                let result = try executePlaylistScriptCommand(line)
+                output.append("OK line \(lineNumber): \(result)")
+                successCount += 1
+            } catch {
+                output.append("ERR line \(lineNumber): \(error.localizedDescription)")
+            }
+        }
+
+        if successCount == 0 {
+            errorMessage = "No commands succeeded."
+        } else {
+            errorMessage = nil
+        }
+
+        return output.joined(separator: "\n")
+    }
+
+    private func executePlaylistScriptCommand(_ line: String) throws -> String {
+        if let playlistName = scriptCapture(
+            in: line,
+            pattern: #"^NEW\s+PLAYLIST\s*\(\s*'([^']+)'\s*\)\s*$"#,
+            group: 1
+        ) {
+            let id = createPlaylistIfMissing(named: playlistName)
+            selectedPlaylistID = id
+            rebuildDisplayedPlaylist()
+            return "Playlist '\(playlistName)' is ready."
+        }
+
+        if let artist = scriptCapture(
+            in: line,
+            pattern: #"^INSERT\s+LIBRARY\.BYARTIST\s*\(\s*'([^']+)'\s*\)\s+INTO\s+PLAYLIST\s*\(\s*'([^']+)'\s*\)\s*$"#,
+            group: 1
+        ), let playlistName = scriptCapture(
+            in: line,
+            pattern: #"^INSERT\s+LIBRARY\.BYARTIST\s*\(\s*'([^']+)'\s*\)\s+INTO\s+PLAYLIST\s*\(\s*'([^']+)'\s*\)\s*$"#,
+            group: 2
+        ) {
+            return try insertLibraryByArtist(artist: artist, intoPlaylistNamed: playlistName)
+        }
+
+        throw PlaylistScriptError.unsupportedCommand
+    }
+
+    private func scriptCapture(in line: String, pattern: String, group: Int) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let range = NSRange(location: 0, length: (line as NSString).length)
+        guard let match = regex.firstMatch(in: line, options: [], range: range),
+              match.numberOfRanges > group,
+              let captured = Range(match.range(at: group), in: line)
+        else {
+            return nil
+        }
+        return String(line[captured]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func createPlaylistIfMissing(named rawName: String) -> SavedPlaylist.ID {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let existing = savedPlaylists.first(where: { $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame }) {
+            return existing.id
+        }
+        let playlist = SavedPlaylist(name: name, trackPaths: [])
+        savedPlaylists.append(playlist)
+        sortAndPersistPlaylists()
+        return playlist.id
+    }
+
+    private func insertLibraryByArtist(artist rawArtist: String, intoPlaylistNamed rawPlaylistName: String) throws -> String {
+        let artist = rawArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+        let playlistName = rawPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !artist.isEmpty, !playlistName.isEmpty else {
+            throw PlaylistScriptError.invalidArguments
+        }
+
+        let matches = libraryCatalog.filter {
+            $0.artist.localizedCaseInsensitiveCompare(artist) == .orderedSame
+        }
+        guard !matches.isEmpty else {
+            throw PlaylistScriptError.artistNotFound(artist)
+        }
+
+        let playlistID = createPlaylistIfMissing(named: playlistName)
+        addTracks(matches, to: playlistID)
+        selectedPlaylistID = playlistID
+        rebuildDisplayedPlaylist()
+        return "Inserted \(matches.count) track(s) by '\(artist)' into '\(playlistName)'."
+    }
+
     func playPause() {
         isPlaying ? pause() : play()
     }
@@ -705,7 +824,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 artist: artist.map { cleaned($0, fallback: original.artist) } ?? original.artist,
                 album: album.map { cleaned($0, fallback: original.album) } ?? original.album,
                 genre: genre.map { cleaned($0, fallback: original.genre) } ?? original.genre,
-                trackNumber: original.trackNumber
+                trackNumber: original.trackNumber,
+                fidelityLabel: original.fidelityLabel
             )
 
             libraryCatalog[index] = updatedTrack
@@ -717,7 +837,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 artist: updatedTrack.artist,
                 album: updatedTrack.album,
                 genre: updatedTrack.genre,
-                trackNumber: updatedTrack.trackNumber
+                trackNumber: updatedTrack.trackNumber,
+                fidelityLabel: updatedTrack.fidelityLabel
             )
             self.index.tracks.removeAll { FilePathNormalization.pathsMatch($0.path, pathForIndex) }
             self.index.tracks.append(indexedTrack)
@@ -1047,11 +1168,27 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             let artist = String(filename[..<separator.lowerBound]).trimmingCharacters(in: .whitespaces)
             let title = String(filename[separator.upperBound...]).trimmingCharacters(in: .whitespaces)
             if !artist.isEmpty && !title.isEmpty {
-                return Track(url: url, title: title, artist: artist, album: "Unknown Album", genre: "Unknown Genre", trackNumber: nil)
+                return Track(
+                    url: url,
+                    title: title,
+                    artist: artist,
+                    album: "Unknown Album",
+                    genre: "Unknown Genre",
+                    trackNumber: nil,
+                    fidelityLabel: AudioFidelityFormatter.fallbackLabel(forExtension: url.pathExtension)
+                )
             }
         }
 
-        return Track(url: url, title: filename, artist: "Unknown Artist", album: "Unknown Album", genre: "Unknown Genre", trackNumber: nil)
+        return Track(
+            url: url,
+            title: filename,
+            artist: "Unknown Artist",
+            album: "Unknown Album",
+            genre: "Unknown Genre",
+            trackNumber: nil,
+            fidelityLabel: AudioFidelityFormatter.fallbackLabel(forExtension: url.pathExtension)
+        )
     }
 
     private func startProgressTimer() {
@@ -1262,7 +1399,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 artist: $0.artist,
                 album: $0.album,
                 genre: $0.genre,
-                trackNumber: $0.trackNumber
+                trackNumber: $0.trackNumber,
+                fidelityLabel: $0.fidelityLabel
             )
         }
         cleanupPlaylistsForAvailableTracks()
@@ -1283,6 +1421,23 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         let indexToSave = index
         Task.detached(priority: .utility) { [indexer] in
             await indexer.saveIndex(indexToSave, generation: generation)
+        }
+    }
+}
+
+private enum PlaylistScriptError: LocalizedError {
+    case unsupportedCommand
+    case invalidArguments
+    case artistNotFound(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedCommand:
+            return "Unsupported command. Try NEW PLAYLIST('Name') or INSERT Library.ByArtist('Artist') INTO Playlist('Name')."
+        case .invalidArguments:
+            return "Invalid arguments. Check quoted values."
+        case let .artistNotFound(name):
+            return "No library tracks found for artist '\(name)'."
         }
     }
 }

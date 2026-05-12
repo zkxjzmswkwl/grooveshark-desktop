@@ -8,6 +8,7 @@ struct Track: Identifiable, Equatable, Hashable {
     let album: String
     let genre: String
     let trackNumber: Int?
+    let fidelityLabel: String
 }
 
 enum LibraryGrouping: String, CaseIterable, Identifiable, Codable {
@@ -86,14 +87,24 @@ struct IndexedTrack: Codable {
     let album: String
     let genre: String
     let trackNumber: Int?
+    let fidelityLabel: String
 
-    init(path: String, title: String, artist: String, album: String, genre: String, trackNumber: Int? = nil) {
+    init(
+        path: String,
+        title: String,
+        artist: String,
+        album: String,
+        genre: String,
+        trackNumber: Int? = nil,
+        fidelityLabel: String? = nil
+    ) {
         self.path = path
         self.title = title
         self.artist = artist
         self.album = album
         self.genre = genre
         self.trackNumber = trackNumber
+        self.fidelityLabel = fidelityLabel ?? AudioFidelityFormatter.fallbackLabel(forPath: path)
     }
 
     init(from decoder: Decoder) throws {
@@ -104,6 +115,8 @@ struct IndexedTrack: Codable {
         album = try container.decodeIfPresent(String.self, forKey: .album) ?? "Unknown Album"
         genre = try container.decode(String.self, forKey: .genre)
         trackNumber = try container.decodeIfPresent(Int.self, forKey: .trackNumber)
+        fidelityLabel = try container.decodeIfPresent(String.self, forKey: .fidelityLabel)
+            ?? AudioFidelityFormatter.fallbackLabel(forPath: path)
     }
 }
 
@@ -174,7 +187,8 @@ struct LibraryIndex: Codable {
                 artist: entry.artist,
                 album: entry.album,
                 genre: entry.genre,
-                trackNumber: entry.trackNumber
+                trackNumber: entry.trackNumber,
+                fidelityLabel: entry.fidelityLabel
             )
         }
         var rebuilt: [String: IndexedTrack] = [:]
@@ -186,10 +200,34 @@ struct LibraryIndex: Codable {
                 artist: edited.artist,
                 album: edited.album,
                 genre: edited.genre,
-                trackNumber: edited.trackNumber
+                trackNumber: edited.trackNumber,
+                fidelityLabel: edited.fidelityLabel
             )
         }
         roots = roots.map { LibraryRootIndex(path: FilePathNormalization.canonical($0.path), fingerprint: $0.fingerprint) }
+    }
+}
+
+enum AudioFidelityFormatter {
+    private static let losslessExtensions: Set<String> = ["flac", "alac", "wav", "aiff", "aif", "ape"]
+    private static let lossyExtensions: Set<String> = ["mp3", "m4a", "aac", "ogg", "opus", "wma"]
+
+    static func label(kbps: Int?, pathExtension: String) -> String {
+        if let kbps, kbps > 0 {
+            return "\(kbps) kbps"
+        }
+        return fallbackLabel(forExtension: pathExtension)
+    }
+
+    static func fallbackLabel(forPath path: String) -> String {
+        fallbackLabel(forExtension: URL(fileURLWithPath: path).pathExtension)
+    }
+
+    static func fallbackLabel(forExtension ext: String) -> String {
+        let lowered = ext.lowercased()
+        if losslessExtensions.contains(lowered) { return "Lossless" }
+        if lossyExtensions.contains(lowered) { return "Lossy" }
+        return lowered.isEmpty ? "Unknown" : lowered.uppercased()
     }
 }
 

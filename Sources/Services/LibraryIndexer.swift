@@ -53,7 +53,8 @@ actor LibraryIndexer {
                     artist: metadata.artist,
                     album: metadata.album,
                     genre: metadata.genre,
-                    trackNumber: metadata.trackNumber
+                    trackNumber: metadata.trackNumber,
+                    fidelityLabel: metadata.fidelityLabel
                 )
             )
         }
@@ -116,7 +117,14 @@ actor LibraryIndexer {
         return RootFingerprint(fileCount: fileCount, latestModificationTime: latestDate.timeIntervalSince1970)
     }
 
-    private func extractMetadata(for url: URL) async -> (title: String, artist: String, album: String, genre: String, trackNumber: Int?) {
+    private func extractMetadata(for url: URL) async -> (
+        title: String,
+        artist: String,
+        album: String,
+        genre: String,
+        trackNumber: Int?,
+        fidelityLabel: String
+    ) {
         if url.pathExtension.lowercased() == "flac",
            let flacMetadata = flacVorbisMetadata(for: url) {
             return flacMetadata
@@ -128,6 +136,7 @@ actor LibraryIndexer {
         let metadataItems = allMetadataItems(for: asset)
         let fallback = fallbackMetadata(from: fallbackTitle)
         let finderMetadata = spotlightMetadata(for: url)
+        let bitrateKbps = estimatedBitrateKbps(for: asset)
 
         let title: String
         if let tagTitle = metadataValue(in: metadataItems, exactKeys: ["title", "tit2", "©nam", "name"], containsKeys: ["title"]) {
@@ -167,10 +176,24 @@ actor LibraryIndexer {
 
         let trackNumber = metadataTrackNumber(in: metadataItems) ?? finderMetadata.trackNumber
 
-        return (title, artist, album, genre, trackNumber)
+        return (
+            title,
+            artist,
+            album,
+            genre,
+            trackNumber,
+            AudioFidelityFormatter.label(kbps: bitrateKbps, pathExtension: url.pathExtension)
+        )
     }
 
-    private func flacVorbisMetadata(for url: URL) -> (title: String, artist: String, album: String, genre: String, trackNumber: Int?)? {
+    private func flacVorbisMetadata(for url: URL) -> (
+        title: String,
+        artist: String,
+        album: String,
+        genre: String,
+        trackNumber: Int?,
+        fidelityLabel: String
+    )? {
         guard let metaflac = findExecutable(named: "metaflac") else { return nil }
 
         let process = Process()
@@ -201,7 +224,8 @@ actor LibraryIndexer {
                 artist: cleanArtistValue(tags["ARTIST"]) ?? fallback.artist,
                 album: tags["ALBUM"] ?? fallback.album,
                 genre: tags["GENRE"] ?? fallback.genre,
-                trackNumber: parseTrackNumber(tags["TRACKNUMBER"])
+                trackNumber: parseTrackNumber(tags["TRACKNUMBER"]),
+                fidelityLabel: "Lossless"
             )
         } catch {
             return nil
@@ -282,6 +306,15 @@ actor LibraryIndexer {
         }
 
         return items
+    }
+
+    private func estimatedBitrateKbps(for asset: AVURLAsset) -> Int? {
+        let rates = asset
+            .tracks(withMediaType: .audio)
+            .map(\.estimatedDataRate)
+            .filter { $0 > 0 }
+        guard let rate = rates.max() else { return nil }
+        return Int((rate / 1000).rounded())
     }
 
     private func metadataValue(in items: [AVMetadataItem], exactKeys: Set<String>, containsKeys: [String]) -> String? {

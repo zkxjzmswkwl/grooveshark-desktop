@@ -24,7 +24,7 @@ struct UserSettingsView: View {
                 activeTabContent
             }
             .padding(18)
-            .background(Color(red: 0.91, green: 0.91, blue: 0.89))
+            .background(Color.grooveSurface)
 
             footer
         }
@@ -46,16 +46,16 @@ struct UserSettingsView: View {
                 } label: {
                     Text(tab.rawValue)
                         .appFont(size: 12, weight: .semibold)
-                        .foregroundStyle(selectedTab == tab ? .white : .black.opacity(0.72))
+                        .foregroundStyle(selectedTab == tab ? .white : Color.grooveTextPrimary.opacity(0.90))
                         .frame(maxWidth: .infinity)
                         .frame(height: 28)
                         .background(
                             RoundedRectangle(cornerRadius: 4)
-                                .fill(selectedTab == tab ? Color.grooveOrange : Color.white.opacity(0.95))
+                                .fill(selectedTab == tab ? Color.grooveOrange : Color.grooveSurfaceRaised.opacity(0.95))
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: 4)
-                                .stroke(Color.black.opacity(0.22), lineWidth: 1)
+                                .stroke(Color.grooveBorder, lineWidth: 1)
                         )
                 }
                 .buttonStyle(.plain)
@@ -64,7 +64,7 @@ struct UserSettingsView: View {
         .padding(4)
         .background(
             RoundedRectangle(cornerRadius: 6)
-                .fill(Color.white.opacity(0.58))
+                .fill(Color.grooveSurfaceRaised.opacity(0.58))
         )
     }
 
@@ -84,12 +84,14 @@ struct UserSettingsView: View {
 
     private var generalTabContent: some View {
         VStack(alignment: .leading, spacing: 16) {
+            settingControl(for: "darkModeEnabled")
+            settingControl(for: "showFidelityColumn")
             settingControl(for: "username")
             settingControl(for: "volume")
             settingControl(for: "fontScale")
             Text("Changes save automatically and are restored when the app starts.")
                 .appFont(size: 11)
-                .foregroundStyle(.black.opacity(0.55))
+                .foregroundStyle(Color.grooveTextSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -108,11 +110,11 @@ struct UserSettingsView: View {
             }
             .buttonStyle(.plain)
             .appFont(size: 12, weight: .semibold)
-            .foregroundStyle(.black.opacity(0.74))
+            .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
             .padding(.horizontal, 10)
             .frame(height: 26)
-            .background(Color.white)
-            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black.opacity(0.25), lineWidth: 1))
+            .background(Color.grooveSurfaceRaised)
+            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.grooveBorder, lineWidth: 1))
         }
     }
 
@@ -127,7 +129,7 @@ struct UserSettingsView: View {
 
             Text("Authorize from here: enter API key and shared secret, then click Connect Last.fm.")
                 .appFont(size: 11)
-                .foregroundStyle(.black.opacity(0.55))
+                .foregroundStyle(Color.grooveTextSecondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             Button {
@@ -137,11 +139,11 @@ struct UserSettingsView: View {
             }
             .buttonStyle(.plain)
             .appFont(size: 12, weight: .semibold)
-            .foregroundStyle(.black.opacity(0.74))
+            .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
             .padding(.horizontal, 10)
             .frame(height: 26)
-            .background(Color.white)
-            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black.opacity(0.25), lineWidth: 1))
+            .background(Color.grooveSurfaceRaised)
+            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.grooveBorder, lineWidth: 1))
             .disabled(!player.canBeginLastFMAuthorization || player.isAuthorizingLastFM)
         }
     }
@@ -156,14 +158,14 @@ struct UserSettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(player.librarySharingStatus)
                         .appFont(size: 11)
-                        .foregroundStyle(.black.opacity(0.60))
+                        .foregroundStyle(Color.grooveTextSecondary)
                         .fixedSize(horizontal: false, vertical: true)
 
                     if !player.librarySharingAddress.isEmpty {
                         HStack(spacing: 8) {
                             Text(player.librarySharingAddress)
                                 .appMonospacedDigitFont(size: 11)
-                                .foregroundStyle(.black.opacity(0.72))
+                                .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
                                 .textSelection(.enabled)
                             Spacer()
                             Button("Copy") {
@@ -171,7 +173,7 @@ struct UserSettingsView: View {
                             }
                             .buttonStyle(.plain)
                             .appFont(size: 11, weight: .semibold)
-                            .foregroundStyle(.black.opacity(0.74))
+                            .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
                         }
                     }
                 }
@@ -184,11 +186,11 @@ struct UserSettingsView: View {
                     }
                     .buttonStyle(.plain)
                     .appFont(size: 12, weight: .semibold)
-                    .foregroundStyle(.black.opacity(0.74))
+                    .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
                     .padding(.horizontal, 10)
                     .frame(height: 26)
-                    .background(Color.white)
-                    .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black.opacity(0.25), lineWidth: 1))
+                    .background(Color.grooveSurfaceRaised)
+                    .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.grooveBorder, lineWidth: 1))
                     .disabled(!player.isSharingLibrary && !player.canShareLibrary)
 
                     Button {
@@ -198,11 +200,11 @@ struct UserSettingsView: View {
                     }
                     .buttonStyle(.plain)
                     .appFont(size: 12, weight: .semibold)
-                    .foregroundStyle(.black.opacity(0.74))
+                    .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
                     .padding(.horizontal, 10)
                     .frame(height: 26)
-                    .background(Color.white)
-                    .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black.opacity(0.25), lineWidth: 1))
+                    .background(Color.grooveSurfaceRaised)
+                    .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.grooveBorder, lineWidth: 1))
                     .disabled(player.isDownloadingSharedLibrary)
                 }
 
@@ -224,7 +226,7 @@ struct UserSettingsView: View {
 
                 Text("Share only on trusted networks. Anyone with this address can browse and download your indexed tracks.")
                     .appFont(size: 11)
-                    .foregroundStyle(.black.opacity(0.55))
+                    .foregroundStyle(Color.grooveTextSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -240,7 +242,7 @@ struct UserSettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text(title)
                 .appFont(size: 12, weight: .bold)
-                .foregroundStyle(.black.opacity(0.72))
+                .foregroundStyle(Color.grooveTextPrimary.opacity(0.90))
 
             transferLane(
                 heading: "Downloaded/Served",
@@ -267,8 +269,8 @@ struct UserSettingsView: View {
             )
         }
         .padding(10)
-        .background(Color.white.opacity(0.8))
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.black.opacity(0.15), lineWidth: 1))
+        .background(Color.grooveSurfaceRaised.opacity(0.8))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.grooveBorder, lineWidth: 1))
     }
 
     private func transferLane(
@@ -284,24 +286,24 @@ struct UserSettingsView: View {
                     .foregroundStyle(iconColor)
                 Text("\(heading) (\(tracks.count))")
                     .appFont(size: 11, weight: .bold)
-                    .foregroundStyle(.black.opacity(0.68))
+                    .foregroundStyle(Color.grooveTextPrimary.opacity(0.88))
             }
 
             if tracks.isEmpty {
                 Text(emptyMessage)
                     .appFont(size: 11)
-                    .foregroundStyle(.black.opacity(0.48))
+                    .foregroundStyle(Color.grooveTextSecondary)
             } else {
                 ForEach(Array(tracks.prefix(5))) { track in
                     Text(trackLabel(track))
                         .appFont(size: 11)
-                        .foregroundStyle(.black.opacity(0.64))
+                        .foregroundStyle(Color.grooveTextPrimary.opacity(0.84))
                         .lineLimit(1)
                 }
                 if tracks.count > 5 {
                     Text("+\(tracks.count - 5) more")
                         .appFont(size: 11)
-                        .foregroundStyle(.black.opacity(0.48))
+                        .foregroundStyle(Color.grooveTextSecondary)
                 }
             }
         }
@@ -323,7 +325,7 @@ struct UserSettingsView: View {
             Spacer()
             Text("User preferences")
                 .appFont(size: 11)
-                .foregroundStyle(.white.opacity(0.65))
+                .foregroundStyle(Color.white.opacity(0.70))
         }
         .padding(.horizontal, 16)
         .frame(height: 42)
@@ -348,12 +350,12 @@ struct UserSettingsView: View {
             .padding(.horizontal, 14)
             .frame(height: 24)
             .background(Color.grooveOrange)
-            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black.opacity(0.25), lineWidth: 1))
+            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.grooveBorder, lineWidth: 1))
         }
         .padding(14)
         .background(
             LinearGradient(
-                colors: [Color.white, Color(red: 0.83, green: 0.84, blue: 0.86)],
+                colors: [Color.grooveSurfaceRaised, Color.grooveSurfaceSecondary],
                 startPoint: .top,
                 endPoint: .bottom
             )
@@ -416,9 +418,9 @@ struct UserSettingsView: View {
             .appFont(size: 13)
             .padding(.horizontal, 8)
             .frame(height: 26)
-            .background(Color.white)
-            .foregroundStyle(.black)
-            .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color.black.opacity(0.24), lineWidth: 1))
+            .background(Color.grooveSurfaceRaised)
+            .foregroundStyle(Color.grooveTextPrimary)
+            .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color.grooveBorder, lineWidth: 1))
         }
     }
 
@@ -434,7 +436,7 @@ struct UserSettingsView: View {
                 Spacer()
                 Text(display.format(value.get(player.currentUserSettings)))
                     .appMonospacedDigitFont(size: 11)
-                    .foregroundStyle(.black.opacity(0.55))
+                    .foregroundStyle(Color.grooveTextSecondary)
             }
 
             Slider(
@@ -452,12 +454,12 @@ struct UserSettingsView: View {
         )
         .toggleStyle(.checkbox)
         .appFont(size: 12, weight: .bold)
-        .foregroundStyle(.black.opacity(0.68))
+        .foregroundStyle(Color.grooveTextPrimary.opacity(0.88))
     }
 
     private func settingLabel(_ title: String) -> some View {
         Text(title)
             .appFont(size: 12, weight: .bold)
-            .foregroundStyle(.black.opacity(0.68))
+            .foregroundStyle(Color.grooveTextPrimary.opacity(0.88))
     }
 }

@@ -116,13 +116,15 @@ struct UserSettingDropdownOption: Identifiable, Hashable {
 }
 
 struct UserSettings: Codable, Equatable {
-    static let currentVersion = 4
+    static let currentVersion = 6
     @MainActor
     static let fields: [UserSettingField] = [
         .dropdown(name: "libraryGrouping", label: "Group Library By", keyPath: \.libraryGrouping),
         .dropdown(name: "librarySortOption", label: "Sort Songs By", keyPath: \.librarySortOption),
         .slider(name: "volume", label: "Volume", keyPath: \.volume, display: .percent),
         .slider(name: "fontScale", label: "Font Scale", keyPath: \.fontScale, range: 0.8...1.8, display: .percent),
+        .checkbox(name: "darkModeEnabled", label: "Enable dark mode", keyPath: \.darkModeEnabled),
+        .checkbox(name: "showFidelityColumn", label: "Show fidelity column", keyPath: \.showFidelityColumn),
         .text(name: "username", label: "Your username", keyPath: \.username),
         .checkbox(name: "lastFMScrobblingEnabled", label: "Enable Last.fm scrobbling", keyPath: \.lastFMScrobblingEnabled),
         .text(name: "lastFMAPIKey", label: "Last.fm API key", keyPath: \.lastFMAPIKey),
@@ -134,6 +136,8 @@ struct UserSettings: Codable, Equatable {
     var version: Int
     var volume: Float
     var fontScale: Float
+    var darkModeEnabled: Bool
+    var showFidelityColumn: Bool
     var username: String
     var libraryGrouping: LibraryGrouping
     var librarySortOption: LibrarySortOption
@@ -147,6 +151,8 @@ struct UserSettings: Codable, Equatable {
         version: currentVersion,
         volume: 0.9,
         fontScale: 1.0,
+        darkModeEnabled: false,
+        showFidelityColumn: false,
         username: NSUserName(),
         libraryGrouping: .artist,
         librarySortOption: .artist,
@@ -161,6 +167,8 @@ struct UserSettings: Codable, Equatable {
         version: Int,
         volume: Float,
         fontScale: Float,
+        darkModeEnabled: Bool,
+        showFidelityColumn: Bool,
         username: String,
         libraryGrouping: LibraryGrouping,
         librarySortOption: LibrarySortOption,
@@ -173,6 +181,8 @@ struct UserSettings: Codable, Equatable {
         self.version = version
         self.volume = volume
         self.fontScale = fontScale
+        self.darkModeEnabled = darkModeEnabled
+        self.showFidelityColumn = showFidelityColumn
         self.username = username
         self.libraryGrouping = libraryGrouping
         self.librarySortOption = librarySortOption
@@ -188,6 +198,8 @@ struct UserSettings: Codable, Equatable {
         version = try container.decodeIfPresent(Int.self, forKey: .version) ?? Self.currentVersion
         volume = try container.decodeIfPresent(Float.self, forKey: .volume) ?? Self.default.volume
         fontScale = try container.decodeIfPresent(Float.self, forKey: .fontScale) ?? Self.default.fontScale
+        darkModeEnabled = try container.decodeIfPresent(Bool.self, forKey: .darkModeEnabled) ?? Self.default.darkModeEnabled
+        showFidelityColumn = try container.decodeIfPresent(Bool.self, forKey: .showFidelityColumn) ?? Self.default.showFidelityColumn
         username = try container.decodeIfPresent(String.self, forKey: .username) ?? Self.default.username
         libraryGrouping = try container.decodeIfPresent(LibraryGrouping.self, forKey: .libraryGrouping) ?? Self.default.libraryGrouping
         librarySortOption = try container.decodeIfPresent(LibrarySortOption.self, forKey: .librarySortOption) ?? Self.default.librarySortOption
