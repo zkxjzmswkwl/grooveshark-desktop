@@ -20,7 +20,12 @@ actor ArtworkProvider {
             artworkDirectory: albumArtworkDirectory()
         )
 
-        // 1–2: Local files first (fast). Previously AcoustID ran before these and blocked on fpcalc + network.
+        // User-supplied album art should override any cached remote guess.
+        if let localArtwork = localFolderArtworkData(for: track) {
+            return localArtwork
+        }
+
+        // 1–2: App cache first (fast). Previously AcoustID ran before these and blocked on fpcalc + network.
         if let cached = try? Data(contentsOf: mainURL) {
             return cached
         }
@@ -56,6 +61,35 @@ actor ArtworkProvider {
         removeMapEntry(for: track)
 
         return await artworkData(for: track)
+    }
+
+    private func localFolderArtworkData(for track: Track) -> Data? {
+        let albumFolder = track.url.deletingLastPathComponent()
+        let preferredNames = ["cover.jpg", "cover.png"]
+
+        for name in preferredNames {
+            let url = albumFolder.appendingPathComponent(name, isDirectory: false)
+            if let data = try? Data(contentsOf: url) {
+                return data
+            }
+        }
+
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: albumFolder,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        for name in preferredNames {
+            if let match = contents.first(where: { $0.lastPathComponent.caseInsensitiveCompare(name) == .orderedSame }),
+               let data = try? Data(contentsOf: match) {
+                return data
+            }
+        }
+
+        return nil
     }
 
     private func downloadFingerprintArtworkFromAcoustid(for track: Track, fingerprintURL: URL) async -> Data? {
@@ -223,12 +257,14 @@ actor ArtworkProvider {
     }
 
     private func lookupITunesArtworkURL(for track: Track) async -> URL? {
-        let term = "\(track.artist) \(track.album == "Unknown Album" ? track.title : track.album)"
+        let albumIsKnown = !isPlaceholder(track.album, placeholder: "Unknown Album")
+        let term = "\(track.artist) \(albumIsKnown ? track.album : track.title)"
         var components = URLComponents(string: "https://itunes.apple.com/search")
         components?.queryItems = [
             URLQueryItem(name: "term", value: term),
-            URLQueryItem(name: "entity", value: "album"),
-            URLQueryItem(name: "limit", value: "1")
+            URLQueryItem(name: "media", value: "music"),
+            URLQueryItem(name: "entity", value: albumIsKnown ? "album" : "song"),
+            URLQueryItem(name: "limit", value: "10")
         ]
 
         guard let url = components?.url else { return nil }
@@ -236,10 +272,79 @@ actor ArtworkProvider {
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
             let response = try JSONDecoder().decode(ITunesArtworkResponse.self, from: data)
-            guard let rawURL = response.results.first?.artworkUrl100 else { return nil }
-            return URL(string: rawURL.replacingOccurrences(of: "100x100bb", with: "600x600bb"))
+            return bestITunesArtworkURL(from: response.results, matching: track)
         } catch {
             return nil
         }
+    }
+
+    private func bestITunesArtworkURL(from results: [ITunesArtworkResult], matching track: Track) -> URL? {
+        let albumIsKnown = !isPlaceholder(track.album, placeholder: "Unknown Album")
+        let artistIsKnown = !isPlaceholder(track.artist, placeholder: "Unknown Artist")
+
+        let ranked = results.enumerated().compactMap { offset, result -> (url: URL, score: Int, offset: Int)? in
+            guard let rawURL = result.artworkUrl100,
+                  let url = URL(string: rawURL.replacingOccurrences(of: "100x100bb", with: "600x600bb")) else {
+                return nil
+            }
+
+            let artistScore = artistMatchScore(candidate: result.artistName ?? "", target: track.artist)
+            if artistIsKnown && artistScore == 0 {
+                return nil
+            }
+
+            let score: Int
+            if albumIsKnown {
+                let albumScore = matchScore(candidate: result.collectionName ?? "", target: track.album)
+                guard albumScore >= 6 else { return nil }
+                score = albumScore + artistScore
+            } else {
+                let titleScore = matchScore(candidate: result.trackName ?? "", target: track.title)
+                guard titleScore >= 6 else { return nil }
+                score = titleScore + artistScore
+            }
+
+            return (url, score, offset)
+        }
+        .sorted {
+            if $0.score == $1.score {
+                return $0.offset < $1.offset
+            }
+            return $0.score > $1.score
+        }
+
+        return ranked.first?.url
+    }
+
+    private func matchScore(candidate: String, target: String) -> Int {
+        let left = normalized(candidate)
+        let right = normalized(target)
+        guard !left.isEmpty, !right.isEmpty else { return 0 }
+        if left == right { return 10 }
+        if left.contains(right) || right.contains(left) { return 6 }
+        return 0
+    }
+
+    private func artistMatchScore(candidate: String, target: String) -> Int {
+        matchScore(candidate: primaryArtist(candidate), target: primaryArtist(target))
+    }
+
+    private func isPlaceholder(_ value: String, placeholder: String) -> Bool {
+        let normalizedValue = normalized(value)
+        return normalizedValue.isEmpty || normalizedValue == normalized(placeholder)
+    }
+
+    private func primaryArtist(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let delimiters = [
+            " feat.", " feat ", " ft.", " ft ", " featuring ", " with ",
+        ]
+        for delimiter in delimiters {
+            if let range = value.range(of: delimiter, options: .caseInsensitive) {
+                value = String(value[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                break
+            }
+        }
+        return value.isEmpty ? raw.trimmingCharacters(in: .whitespacesAndNewlines) : value
     }
 }

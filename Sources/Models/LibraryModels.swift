@@ -237,6 +237,9 @@ struct ITunesArtworkResponse: Decodable {
 
 struct ITunesArtworkResult: Decodable {
     let artworkUrl100: String?
+    let artistName: String?
+    let collectionName: String?
+    let trackName: String?
 }
 
 struct AcoustIDResponse: Decodable {
