@@ -204,6 +204,7 @@ actor LibraryIndexer {
             "--show-tag=ARTIST",
             "--show-tag=ALBUM",
             "--show-tag=GENRE",
+            "--show-tag=TRACKNUMBER",
             url.path
         ]
         process.standardOutput = output

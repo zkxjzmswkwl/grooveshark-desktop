@@ -897,7 +897,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
         return grouped
             .map { name, tracks in
-                LibraryGroup(name: name, tracks: tracks.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending })
+                LibraryGroup(name: name, tracks: sortedTracks(tracks))
             }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
@@ -951,13 +951,13 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         tracks.sorted { lhs, rhs in
             switch sortOption {
             case .title:
-                return compare(lhs.title, rhs.title, fallback: lhs.artist, rhs.artist)
+                return compareTracks(lhs, rhs, primary: \.title)
             case .artist:
-                return compare(lhs.artist, rhs.artist, fallback: lhs.title, rhs.title)
+                return compareTracks(lhs, rhs, primary: \.artist)
             case .album:
-                return compareAlbumTracks(lhs, rhs)
+                return compareTracks(lhs, rhs, primary: \.album)
             case .genre:
-                return compare(lhs.genre, rhs.genre, fallback: lhs.artist, rhs.artist)
+                return compareTracks(lhs, rhs, primary: \.genre)
             }
         }
     }
@@ -1072,38 +1072,32 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
 
-    private func compareAlbumTracks(_ lhs: Track, _ rhs: Track) -> Bool {
-        let primary = lhs.album.localizedCaseInsensitiveCompare(rhs.album)
-        if primary != .orderedSame {
-            return primary == .orderedAscending
-        }
+    private func compareTracks(_ lhs: Track, _ rhs: Track, primary: KeyPath<Track, String>) -> Bool {
+        let comparisons: [ComparisonResult] = [
+            lhs[keyPath: primary].localizedCaseInsensitiveCompare(rhs[keyPath: primary]),
+            primary == \.album ? .orderedSame : lhs.album.localizedCaseInsensitiveCompare(rhs.album),
+            compareTrackNumbers(lhs.trackNumber, rhs.trackNumber),
+            lhs.title.localizedCaseInsensitiveCompare(rhs.title),
+            lhs.artist.localizedCaseInsensitiveCompare(rhs.artist),
+            lhs.url.path.localizedCaseInsensitiveCompare(rhs.url.path)
+        ]
 
-        if let byTrackNumber = compareTrackNumbers(lhs.trackNumber, rhs.trackNumber) {
-            return byTrackNumber
-        }
-
-        return compare(lhs.title, rhs.title, fallback: lhs.artist, rhs.artist)
+        return comparisons.first { $0 != .orderedSame } == .orderedAscending
     }
 
-    private func compareTrackNumbers(_ lhs: Int?, _ rhs: Int?) -> Bool? {
+    private func compareTrackNumbers(_ lhs: Int?, _ rhs: Int?) -> ComparisonResult {
         switch (lhs, rhs) {
-        case let (left?, right?) where left != right:
-            return left < right
+        case let (left?, right?) where left < right:
+            return .orderedAscending
+        case let (left?, right?) where left > right:
+            return .orderedDescending
         case (_?, nil):
-            return true
+            return .orderedAscending
         case (nil, _?):
-            return false
+            return .orderedDescending
         default:
-            return nil
+            return .orderedSame
         }
-    }
-
-    private func compare(_ lhs: String, _ rhs: String, fallback lhsFallback: String, _ rhsFallback: String) -> Bool {
-        let primary = lhs.localizedCaseInsensitiveCompare(rhs)
-        if primary == .orderedSame {
-            return lhsFallback.localizedCaseInsensitiveCompare(rhsFallback) == .orderedAscending
-        }
-        return primary == .orderedAscending
     }
 
     private func cleaned(_ value: String, fallback: String) -> String {
@@ -1303,6 +1297,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func loadIndexOnLaunch() async {
+        var forceFullRebuild = false
         if let existing = await indexer.loadIndex() {
             libraryRoots = existing.roots.map { FilePathNormalization.canonical($0.path) }.sorted()
 
@@ -1314,14 +1309,23 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 applyIndexedTracks(loadedIndex.tracks)
                 indexStatus = "Loaded \(loadedIndex.tracks.count) tracks from index"
             } else {
-                index = LibraryIndex(version: LibraryIndex.currentVersion, roots: [], tracks: [], updatedAt: .distantPast)
-                libraryCatalog = []
-                rebuildDisplayedPlaylist()
+                var loadedIndex = LibraryIndex(
+                    version: LibraryIndex.currentVersion,
+                    roots: existing.roots,
+                    tracks: existing.tracks,
+                    updatedAt: existing.updatedAt,
+                    manualEdits: existing.manualEdits
+                )
+                loadedIndex.canonicalizeAllFilePaths()
+                loadedIndex.applyManualEditsForExistingFiles()
+                index = loadedIndex
+                applyIndexedTracks(loadedIndex.tracks)
+                forceFullRebuild = true
                 indexStatus = "Metadata index upgraded; rebuilding library"
             }
         }
 
-        scheduleReindex(reason: "Checking for library changes")
+        scheduleReindex(reason: "Checking for library changes", forceFullRebuild: forceFullRebuild)
     }
 
     /// Forces a full metadata read from disk for every library folder (same as a fingerprint miss on all roots).

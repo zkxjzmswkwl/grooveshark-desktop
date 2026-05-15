@@ -131,7 +131,7 @@ struct LibraryRootIndex: Codable {
 }
 
 struct LibraryIndex: Codable {
-    static let currentVersion = 4
+    static let currentVersion = 5
 
     let version: Int
     var roots: [LibraryRootIndex]
