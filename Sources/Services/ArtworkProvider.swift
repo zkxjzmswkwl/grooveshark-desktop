@@ -13,6 +13,25 @@ actor ArtworkProvider {
             .appendingPathComponent("GrooveShark/artwork/by-album", isDirectory: true)
     }
 
+    func cachedArtworkData(for track: Track) -> Data? {
+        let (_, mainURL, fpURL) = AlbumArtworkIdentity.paths(
+            artist: track.artist,
+            album: track.album,
+            artworkDirectory: albumArtworkDirectory()
+        )
+
+        if let localArtwork = localFolderArtworkData(for: track) {
+            return localArtwork
+        }
+        if let cached = try? Data(contentsOf: mainURL) {
+            return cached
+        }
+        if let cachedFingerprint = try? Data(contentsOf: fpURL) {
+            return cachedFingerprint
+        }
+        return nil
+    }
+
     func artworkData(for track: Track) async -> Data? {
         let (_, mainURL, fpURL) = AlbumArtworkIdentity.paths(
             artist: track.artist,

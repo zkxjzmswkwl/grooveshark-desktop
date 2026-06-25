@@ -14,6 +14,11 @@ struct PlayerView: View {
         case left
     }
 
+    private enum BrowseMode {
+        case songs
+        case albums
+    }
+
     @EnvironmentObject private var player: PlayerViewModel
     @State private var editingSession: MetadataEditSession?
     @State private var selectedTrackIDs: Set<Track.ID> = []
@@ -22,6 +27,7 @@ struct PlayerView: View {
     @State private var containerFrameInWindow: CGRect = .zero
     @State private var songContextMenuSize: CGSize = CGSize(width: 230, height: 160)
     @State private var sidebarDock: SidebarDock = .left
+    @State private var browseMode: BrowseMode = .songs
 
     private let sidebarWidth: CGFloat = 188
     private let sidebarTopBottomHeight: CGFloat = 256
@@ -59,6 +65,11 @@ struct PlayerView: View {
         .sheet(isPresented: $player.isShowingSettings) {
             UserSettingsView()
                 .environmentObject(player)
+        }
+        .sheet(isPresented: $player.isShowingYouTubeDownload) {
+            YouTubeDownloadView()
+                .environmentObject(player)
+                .frame(minWidth: 520, minHeight: 420)
         }
         .onChange(of: player.selectedPlaylistID) { _, _ in
             selectedTrackIDs.removeAll()
@@ -108,10 +119,10 @@ struct PlayerView: View {
             }
             .padding(.horizontal, 13)
 
-            navItem("Search")
-            navItem("Music")
-            navItem("Explore")
-            navItem("Community")
+            navItem("Search", mode: nil)
+            navItem("Music", mode: .songs)
+            navItem("Explore", mode: .albums)
+            navItem("Community", mode: nil)
 
             Spacer()
 
@@ -169,27 +180,41 @@ struct PlayerView: View {
         )
     }
 
-    private func navItem(_ title: String) -> some View {
-        Text(title)
-            .appFont(size: 12, weight: .semibold)
-            .foregroundStyle(.white.opacity(0.72))
-            .padding(.horizontal, 12)
-            .frame(height: 38)
+    private func navItem(_ title: String, mode: BrowseMode?) -> some View {
+        let isSelected = mode.map { browseMode == $0 } ?? false
+
+        return Button {
+            if let mode {
+                browseMode = mode
+            }
+        } label: {
+            Text(title)
+                .appFont(size: 12, weight: isSelected ? .bold : .semibold)
+                .foregroundStyle(isSelected ? .white : .white.opacity(0.72))
+                .padding(.horizontal, 12)
+                .frame(height: 38)
+                .background(isSelected ? Color.white.opacity(0.12) : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .disabled(mode == nil)
     }
 
     private var actionToolbar: some View {
         HStack(spacing: 7) {
-            toolbarButton("Play Radio", systemImage: "play.fill")
-            toolbarButton("Play All", systemImage: "play.fill") {
-                if let first = player.playlist.first {
-                    player.selectTrack(first)
-                }
-            }
-            toolbarButton("Add All", systemImage: "plus") {
-                player.addLibraryFolders()
-            }
-            toolbarButton("Download Shared", systemImage: "square.and.arrow.down") {
+            // toolbarButton("Play Radio", systemImage: "play.fill")
+            // toolbarButton("Play All", systemImage: "play.fill") {
+            //     if let first = player.playlist.first {
+            //         player.selectTrack(first)
+            //     }
+            // }
+            // toolbarButton("Add All", systemImage: "plus") {
+            //     player.addLibraryFolders()
+            // }
+            toolbarButton("P2P Library Sharing", systemImage: "square.and.arrow.down") {
                 player.promptToDownloadSharedLibrary()
+            }
+            toolbarButton("YouTube (yt-dlp)", systemImage: "play.rectangle") {
+                player.isShowingYouTubeDownload = true
             }
             addToPlaylistMenu
             if player.isViewingSavedPlaylist {
@@ -369,24 +394,56 @@ struct PlayerView: View {
             case .left:
                 HStack(spacing: 0) {
                     sidebarSidePanel
-                    songTable
+                    libraryMainContent
                 }
             case .right:
                 HStack(spacing: 0) {
-                    songTable
+                    libraryMainContent
                     sidebarSidePanel
                 }
             case .top:
                 VStack(spacing: 0) {
                     sidebarTopBottomRow
-                    songTable
+                    libraryMainContent
                 }
             case .bottom:
                 VStack(spacing: 0) {
-                    songTable
+                    libraryMainContent
                     sidebarTopBottomRow
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var libraryMainContent: some View {
+        switch browseMode {
+        case .songs:
+            songTable
+        case .albums:
+            AlbumCoverFlowView(
+                albumGroups: player.cachedAlbumGroups,
+                artworkStore: player.artworkStore,
+                indexStatus: player.indexStatus,
+                isReindexing: player.isReindexing,
+                isViewingSavedPlaylist: player.isViewingSavedPlaylist,
+                selectedPlaylistName: player.selectedPlaylistName,
+                hasActiveSearch: player.hasActiveSearch,
+                filteredSongCount: player.filteredPlaylist.count,
+                playlistIsEmpty: player.playlist.isEmpty,
+                currentTrackID: player.currentTrack?.id,
+                isPlaying: player.isPlaying,
+                onAddLibraryFolders: { player.addLibraryFolders() },
+                onClearSearch: { player.searchQuery = "" },
+                onSelectTrack: { player.selectTrack($0) },
+                onWarmArtwork: { player.warmAlbumArtworkFromDisk(for: player.cachedAlbumGroups) },
+                onPrefetchArtwork: { index, groups in
+                    player.prefetchAlbumArtwork(around: index, in: groups)
+                },
+                onLoadArtwork: { player.loadAlbumArtwork(for: $0) },
+                selectedTrackIDs: $selectedTrackIDs
+            )
+            .equatable()
         }
     }
 

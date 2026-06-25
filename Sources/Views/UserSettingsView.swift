@@ -4,6 +4,7 @@ import SwiftUI
 struct UserSettingsView: View {
     private enum SettingsTab: String, CaseIterable, Identifiable {
         case general = "General"
+        case audio = "Audio"
         case library = "Library"
         case lastFM = "Last.fm"
         case sharing = "Sharing"
@@ -73,6 +74,8 @@ struct UserSettingsView: View {
         switch selectedTab {
         case .general:
             generalTabContent
+        case .audio:
+            audioTabContent
         case .library:
             libraryTabContent
         case .lastFM:
@@ -80,6 +83,11 @@ struct UserSettingsView: View {
         case .sharing:
             sharingTabContent
         }
+    }
+
+    private var audioTabContent: some View {
+        EqualizerView()
+            .environmentObject(player)
     }
 
     private var generalTabContent: some View {
@@ -219,12 +227,12 @@ struct UserSettingsView: View {
                 transferSummaryCard(
                     title: "Sharing To Peers",
                     snapshot: player.sharingTransferSnapshot,
-                    currentEmptyMessage: player.isSharingLibrary ? "Waiting for peer requests..." : "Sharing is off",
-                    completedEmptyMessage: "No tracks served yet",
-                    upcomingEmptyMessage: "No tracks available to share"
+                    currentEmptyMessage: player.isSharingLibrary ? "rsync daemon is running" : "Sharing is off",
+                    completedEmptyMessage: "No modules synced yet",
+                    upcomingEmptyMessage: "No library folders exposed"
                 )
 
-                Text("Share only on trusted networks. Anyone with this address can browse and download your indexed tracks.")
+                Text("Share only on trusted networks. rsync exposes your library folders read-only to anyone with this address. Requires rsync (included on macOS).")
                     .appFont(size: 11)
                     .foregroundStyle(Color.grooveTextSecondary)
                     .fixedSize(horizontal: false, vertical: true)

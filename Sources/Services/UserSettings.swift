@@ -116,7 +116,7 @@ struct UserSettingDropdownOption: Identifiable, Hashable {
 }
 
 struct UserSettings: Codable, Equatable {
-    static let currentVersion = 6
+    static let currentVersion = 7
     @MainActor
     static let fields: [UserSettingField] = [
         .dropdown(name: "libraryGrouping", label: "Group Library By", keyPath: \.libraryGrouping),
@@ -130,7 +130,7 @@ struct UserSettings: Codable, Equatable {
         .text(name: "lastFMAPIKey", label: "Last.fm API key", keyPath: \.lastFMAPIKey),
         .text(name: "lastFMAPISecret", label: "Last.fm API shared secret", keyPath: \.lastFMAPISecret),
         .text(name: "lastFMSessionKey", label: "Last.fm session key", keyPath: \.lastFMSessionKey),
-        .text(name: "librarySharingPort", label: "LAN sharing port", keyPath: \.librarySharingPort),
+        .text(name: "librarySharingPort", label: "rsync daemon port", keyPath: \.librarySharingPort),
     ]
 
     var version: Int
@@ -146,6 +146,7 @@ struct UserSettings: Codable, Equatable {
     var lastFMAPISecret: String
     var lastFMSessionKey: String
     var librarySharingPort: String
+    var equalizer: EqualizerSettings
 
     static let `default` = UserSettings(
         version: currentVersion,
@@ -160,7 +161,8 @@ struct UserSettings: Codable, Equatable {
         lastFMAPIKey: "",
         lastFMAPISecret: "",
         lastFMSessionKey: "",
-        librarySharingPort: "43821"
+        librarySharingPort: "873",
+        equalizer: .default
     )
 
     init(
@@ -176,7 +178,8 @@ struct UserSettings: Codable, Equatable {
         lastFMAPIKey: String,
         lastFMAPISecret: String,
         lastFMSessionKey: String,
-        librarySharingPort: String
+        librarySharingPort: String,
+        equalizer: EqualizerSettings
     ) {
         self.version = version
         self.volume = volume
@@ -191,6 +194,7 @@ struct UserSettings: Codable, Equatable {
         self.lastFMAPISecret = lastFMAPISecret
         self.lastFMSessionKey = lastFMSessionKey
         self.librarySharingPort = librarySharingPort
+        self.equalizer = equalizer
     }
 
     init(from decoder: Decoder) throws {
@@ -208,10 +212,12 @@ struct UserSettings: Codable, Equatable {
         lastFMAPISecret = try container.decodeIfPresent(String.self, forKey: .lastFMAPISecret) ?? Self.default.lastFMAPISecret
         lastFMSessionKey = try container.decodeIfPresent(String.self, forKey: .lastFMSessionKey) ?? Self.default.lastFMSessionKey
         librarySharingPort = try container.decodeIfPresent(String.self, forKey: .librarySharingPort) ?? Self.default.librarySharingPort
+        equalizer = try container.decodeIfPresent(EqualizerSettings.self, forKey: .equalizer) ?? Self.default.equalizer
     }
 
     mutating func migrateIfNeeded() {
         version = Self.currentVersion
+        equalizer.normalize()
     }
 }
 

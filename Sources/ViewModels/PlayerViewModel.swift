@@ -5,7 +5,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 @MainActor
-final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
+final class PlayerViewModel: NSObject, ObservableObject {
     @Published var playlist: [Track] = [] {
         didSet { applySearchFilter() }
     }
@@ -57,6 +57,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var artworkImage: NSImage?
     @Published var isRefreshingArtwork = false
     @Published var isShowingSettings = false
+    @Published var isShowingYouTubeDownload = false
     @Published var isAuthorizingLastFM = false
     @Published var isSharingLibrary = false
     @Published var isDownloadingSharedLibrary = false
@@ -64,14 +65,20 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var librarySharingAddress = ""
     @Published private(set) var sharingTransferSnapshot: LibraryTransferQueueSnapshot = .empty
     @Published private(set) var downloadTransferSnapshot: LibraryTransferQueueSnapshot = .empty
+    @Published var isDownloadingFromYouTube = false
+    @Published var youtubeDownloadStatus = "Paste one or more YouTube links."
+    @Published var youtubeDownloadItems: [YouTubeDownloadItem] = []
+    @Published private(set) var cachedAlbumGroups: [AlbumGroup] = []
+    let artworkStore = AlbumArtworkStore()
 
     /// `AlbumArtworkIdentity` key for `artworkImage`; avoids refetch when switching tracks on the same album.
     private var loadedArtworkAlbumKey: String?
+    private var albumArtworkLoadTasks: [String: Task<Void, Never>] = [:]
+    private var albumArtworkWarmTask: Task<Void, Never>?
 
-    private var audioPlayer: AVAudioPlayer?
+    private let playbackEngine = AudioPlaybackEngine()
     private var progressTimer: Timer?
     private var reindexTimer: Timer?
-    private var sharingTransferTimer: Timer?
     private var indexPersistenceGeneration: UInt64 = 0
     private var index = LibraryIndex(version: LibraryIndex.currentVersion, roots: [], tracks: [], updatedAt: .distantPast)
     private let indexer = LibraryIndexer()
@@ -83,6 +90,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private let lastFMScrobbler = LastFMScrobbler()
     private let librarySharingService = LibrarySharingService()
     private let librarySharingClient = LibrarySharingClient()
+    private let youtubeDownloadService = YouTubeDownloadService()
     @Published private(set) var playCounts: [String: Int] = [:]
     private var libraryCatalog: [Track] = []
 
@@ -95,6 +103,9 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     override init() {
         super.init()
+        playbackEngine.onPlaybackFinished = { [weak self] in
+            self?.nextTrack()
+        }
         applySearchFilter()
         playCounts = playCountStore.load()
         savedPlaylists = playlistStore.load().sorted {
@@ -115,12 +126,36 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         userSettings
     }
 
+    var equalizer: EqualizerSettings {
+        userSettings.equalizer
+    }
+
+    func setEqualizerEnabled(_ isEnabled: Bool) {
+        updateUserSettings { $0.equalizer.isEnabled = isEnabled }
+    }
+
+    func setEqualizerPreamp(_ value: Float) {
+        updateUserSettings { $0.equalizer.setPreamp(value) }
+    }
+
+    func setEqualizerBandGain(_ gain: Float, atBandIndex index: Int) {
+        updateUserSettings { $0.equalizer.setGain(gain, atBandIndex: index) }
+    }
+
+    func applyEqualizerPreset(_ preset: EqualizerPreset) {
+        updateUserSettings { $0.equalizer.apply(preset: preset) }
+    }
+
+    func resetEqualizer() {
+        updateUserSettings { $0.equalizer.apply(preset: .flat) }
+    }
+
     var canBeginLastFMAuthorization: Bool {
         !userSettings.lastFMAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var canShareLibrary: Bool {
-        !libraryCatalog.isEmpty
+        !libraryRoots.isEmpty
     }
 
     private var lastFMCredentials: LastFMCredentials? {
@@ -255,7 +290,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         settings.version = UserSettings.currentVersion
 
         userSettings = settings
-        audioPlayer?.volume = settings.volume
+        playbackEngine.volume = settings.volume
+        playbackEngine.applyEqualizer(settings.equalizer)
 
         if previousSortOption != settings.librarySortOption {
             rebuildDisplayedPlaylist()
@@ -305,6 +341,81 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             return groupsBy(\.artist)
         case .genre:
             return groupsBy(\.genre)
+        }
+    }
+
+    var albumGroups: [AlbumGroup] {
+        cachedAlbumGroups
+    }
+
+    func warmAlbumArtworkFromDisk(for groups: [AlbumGroup]) {
+        albumArtworkWarmTask?.cancel()
+        let missingGroups = groups.filter { !artworkStore.contains(key: $0.id) }
+        guard !missingGroups.isEmpty else { return }
+
+        albumArtworkWarmTask = Task { [artworkProvider, artworkStore] in
+            var loaded: [String: NSImage] = [:]
+            loaded.reserveCapacity(missingGroups.count)
+
+            await withTaskGroup(of: (String, NSImage?).self) { taskGroup in
+                for group in missingGroups {
+                    if Task.isCancelled { return }
+                    let key = group.id
+                    let track = group.representativeTrack
+                    taskGroup.addTask {
+                        guard let data = await artworkProvider.cachedArtworkData(for: track) else {
+                            return (key, nil)
+                        }
+                        return (key, AlbumCoverImage.thumbnail(from: data))
+                    }
+                }
+
+                for await (key, image) in taskGroup {
+                    if let image {
+                        loaded[key] = image
+                    }
+                }
+            }
+
+            guard !Task.isCancelled, !loaded.isEmpty else { return }
+            await MainActor.run {
+                artworkStore.mergeImages(loaded)
+            }
+        }
+    }
+
+    func loadAlbumArtwork(for group: AlbumGroup) {
+        let key = group.id
+        guard !artworkStore.contains(key: key) else { return }
+        guard albumArtworkLoadTasks[key] == nil else { return }
+
+        let track = group.representativeTrack
+        albumArtworkLoadTasks[key] = Task { [artworkProvider, artworkStore] in
+            if let data = await artworkProvider.cachedArtworkData(for: track),
+               let image = AlbumCoverImage.thumbnail(from: data) {
+                await MainActor.run {
+                    self.albumArtworkLoadTasks[key] = nil
+                    artworkStore.setImage(image, for: key)
+                }
+                return
+            }
+
+            let data = await artworkProvider.artworkData(for: track)
+            let image = data.flatMap { AlbumCoverImage.thumbnail(from: $0) }
+            await MainActor.run {
+                self.albumArtworkLoadTasks[key] = nil
+                if let image {
+                    artworkStore.setImage(image, for: key)
+                }
+            }
+        }
+    }
+
+    func prefetchAlbumArtwork(around index: Int, in groups: [AlbumGroup]) {
+        guard !groups.isEmpty else { return }
+        let neighborIndexes = [index - 4, index - 3, index - 2, index - 1, index, index + 1, index + 2, index + 3, index + 4]
+        for neighborIndex in neighborIndexes where groups.indices.contains(neighborIndex) {
+            loadAlbumArtwork(for: groups[neighborIndex])
         }
     }
 
@@ -374,8 +485,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     func startLibrarySharing() {
         guard !isSharingLibrary else { return }
-        guard !libraryCatalog.isEmpty else {
-            errorMessage = "Add songs before starting library sharing."
+        guard !libraryRoots.isEmpty else {
+            errorMessage = "Add a library folder before starting library sharing."
             return
         }
 
@@ -385,20 +496,29 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             return
         }
 
-        librarySharingStatus = "Starting library sharing..."
+        librarySharingStatus = "Starting rsync sharing..."
         sharingTransferSnapshot = .empty
 
-        let tracks = libraryCatalog
         let roots = libraryRoots
         Task { [librarySharingService] in
+            let rsyncAvailable = await librarySharingService.isRsyncAvailable()
+            guard rsyncAvailable else {
+                await MainActor.run {
+                    self.errorMessage = LibrarySharingError.rsyncNotFound.localizedDescription
+                    self.librarySharingStatus = "Library sharing is off"
+                }
+                return
+            }
+
             do {
-                let endpoint = try await librarySharingService.start(port: port, tracks: tracks, roots: roots)
+                let endpoint = try await librarySharingService.start(port: port, roots: roots)
+                let snapshot = await librarySharingService.sharingTransferSnapshot()
                 await MainActor.run {
                     self.isSharingLibrary = true
                     self.librarySharingAddress = endpoint
+                    self.sharingTransferSnapshot = snapshot
                     self.updateLibrarySharingStatusLine()
-                    self.indexStatus = "Library sharing is active"
-                    self.startSharingTransferPolling()
+                    self.indexStatus = "Library sharing is active (rsync)"
                 }
             } catch {
                 await MainActor.run {
@@ -421,7 +541,6 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 self.librarySharingStatus = "Library sharing is off"
                 self.sharingTransferSnapshot = .empty
                 self.indexStatus = "Stopped library sharing"
-                self.stopSharingTransferPolling()
             }
         }
     }
@@ -438,14 +557,14 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
         let alert = NSAlert()
         alert.messageText = "Download Shared Library"
-        alert.informativeText = "Enter the address from the other user, for example 192.168.1.42:43821."
+        alert.informativeText = "Enter the rsync address from the other user, for example rsync://192.168.1.42:873/"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "Download")
         alert.addButton(withTitle: "Cancel")
 
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        field.placeholderString = "host:port"
-        field.stringValue = "192.168.1.42:\(userSettings.librarySharingPort)"
+        field.placeholderString = "rsync://host:port/"
+        field.stringValue = "rsync://192.168.1.42:\(userSettings.librarySharingPort)/"
         alert.accessoryView = field
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -467,13 +586,127 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         downloadSharedLibrary(from: address, destinationRoot: destination)
     }
 
+    func isYouTubeDownloadAvailable() async -> Bool {
+        await youtubeDownloadService.isYTDLPAvailable()
+    }
+
+    func downloadFromYouTube(urlText: String) {
+        guard !isDownloadingFromYouTube else { return }
+
+        let urls = YouTubeDownloadService.normalizeURLs([urlText])
+        guard !urls.isEmpty else {
+            youtubeDownloadStatus = "Enter at least one valid YouTube URL."
+            errorMessage = "Enter at least one valid YouTube URL."
+            return
+        }
+
+        isDownloadingFromYouTube = true
+        youtubeDownloadItems = urls.map {
+            YouTubeDownloadItem(
+                id: $0,
+                title: $0,
+                phase: .queued,
+                progress: nil,
+                downloadedPath: nil,
+                errorMessage: nil
+            )
+        }
+        youtubeDownloadStatus = "Starting download..."
+        indexStatus = "Downloading from YouTube..."
+
+        Task { [youtubeDownloadService] in
+            do {
+                let result = try await youtubeDownloadService.download(urls: urls) { update in
+                    await MainActor.run {
+                        if let index = self.youtubeDownloadItems.firstIndex(where: { $0.id == update.url }) {
+                            self.youtubeDownloadItems[index].title = update.title
+                            self.youtubeDownloadItems[index].phase = update.phase
+                            self.youtubeDownloadItems[index].progress = update.progress
+                            self.youtubeDownloadItems[index].downloadedPath = update.downloadedPath
+                            self.youtubeDownloadItems[index].errorMessage = update.errorMessage
+                        }
+
+                        switch update.phase {
+                        case .queued:
+                            self.youtubeDownloadStatus = "Queued: \(update.title)"
+                        case .downloading:
+                            if let progress = update.progress {
+                                self.youtubeDownloadStatus = "Downloading \(update.title) — \(Int(progress * 100))%"
+                            } else {
+                                self.youtubeDownloadStatus = "Downloading \(update.title)..."
+                            }
+                        case .completed:
+                            self.youtubeDownloadStatus = "Downloaded: \(update.title)"
+                        case .skipped:
+                            self.youtubeDownloadStatus = "Already downloaded: \(update.title)"
+                        case .failed:
+                            self.youtubeDownloadStatus = "Failed: \(update.errorMessage ?? update.title)"
+                        }
+                    }
+                }
+
+                await MainActor.run {
+                    self.isDownloadingFromYouTube = false
+                    self.ensureYouTubeLibraryRoot(result.downloadRoot.path)
+
+                    let failedCount = self.youtubeDownloadItems.filter { $0.phase == .failed }.count
+                    if result.downloadedFiles.isEmpty, result.skippedCount > 0, failedCount == 0 {
+                        self.youtubeDownloadStatus = "All \(result.skippedCount) track(s) were already in your library."
+                        self.indexStatus = "YouTube downloads up to date"
+                    } else if failedCount > 0, result.downloadedFiles.isEmpty {
+                        self.youtubeDownloadStatus = "All downloads failed."
+                        self.indexStatus = "YouTube download failed"
+                    } else {
+                        var message = "Added \(result.downloadedFiles.count) track(s) to your library."
+                        if result.skippedCount > 0 {
+                            message += " Skipped \(result.skippedCount) existing."
+                        }
+                        if failedCount > 0 {
+                            message += " \(failedCount) failed."
+                        }
+                        self.youtubeDownloadStatus = message
+                        self.indexStatus = "Downloaded \(result.downloadedFiles.count) track(s) from YouTube"
+                    }
+
+                    if !result.downloadedFiles.isEmpty || result.skippedCount > 0 {
+                        self.scheduleReindex(reason: "Indexing YouTube downloads", forceFullRebuild: true)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.isDownloadingFromYouTube = false
+                    self.youtubeDownloadStatus = error.localizedDescription
+                    self.errorMessage = "YouTube download failed: \(error.localizedDescription)"
+                    self.indexStatus = "YouTube download failed"
+                }
+            }
+        }
+    }
+
+    private func ensureYouTubeLibraryRoot(_ path: String) {
+        let root = FilePathNormalization.canonical(path)
+        guard !libraryRoots.contains(where: { FilePathNormalization.pathsMatch($0, root) }) else { return }
+        libraryRoots.append(root)
+        libraryRoots.sort()
+    }
+
     private func downloadSharedLibrary(from address: String, destinationRoot: URL) {
         guard !isDownloadingSharedLibrary else { return }
         isDownloadingSharedLibrary = true
         downloadTransferSnapshot = .empty
-        indexStatus = "Downloading shared library..."
+        indexStatus = "Downloading shared library via rsync..."
 
-        Task { [librarySharingClient] in
+        Task { [librarySharingClient, librarySharingService] in
+            let rsyncAvailable = await librarySharingService.isRsyncAvailable()
+            guard rsyncAvailable else {
+                await MainActor.run {
+                    self.isDownloadingSharedLibrary = false
+                    self.errorMessage = LibrarySharingError.rsyncNotFound.localizedDescription
+                    self.indexStatus = "Shared library download failed"
+                }
+                return
+            }
+
             do {
                 let result = try await librarySharingClient.downloadLibrary(
                     from: address,
@@ -723,7 +956,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func play() {
-        guard let audioPlayer else {
+        guard playbackEngine.hasLoadedTrack else {
             if !playlist.isEmpty, currentIndex == nil {
                 loadTrack(at: 0)
                 play()
@@ -733,14 +966,14 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         if playbackStartedAtForCurrentTrack == nil {
             playbackStartedAtForCurrentTrack = Date()
         }
-        audioPlayer.play()
+        playbackEngine.play()
         isPlaying = true
         startProgressTimer()
         submitNowPlayingIfNeeded()
     }
 
     func pause() {
-        audioPlayer?.pause()
+        playbackEngine.pause()
         isPlaying = false
         playbackTickAnchor = nil
         stopProgressTimer()
@@ -776,9 +1009,9 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func seek(to value: TimeInterval) {
-        guard let audioPlayer else { return }
-        audioPlayer.currentTime = max(0, min(value, audioPlayer.duration))
-        currentTime = audioPlayer.currentTime
+        guard playbackEngine.hasLoadedTrack else { return }
+        playbackEngine.seek(to: value)
+        currentTime = playbackEngine.currentTime
     }
 
     func forceRefreshArtwork() {
@@ -862,30 +1095,56 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
 
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor [weak self] in
-            self?.nextTrack()
-        }
-    }
-
     private func loadTrack(at index: Int) {
         guard playlist.indices.contains(index) else { return }
         let track = playlist[index]
         resetPlayCountSessionState()
         resetScrobbleSessionState()
         do {
-            let player = try AVAudioPlayer(contentsOf: track.url)
-            player.delegate = self
-            player.prepareToPlay()
-            player.volume = volume
-            audioPlayer = player
+            try playbackEngine.load(url: track.url)
+            playbackEngine.volume = volume
+            playbackEngine.applyEqualizer(userSettings.equalizer)
             currentIndex = index
-            duration = max(player.duration, 1)
+            duration = max(playbackEngine.duration, 1)
             currentTime = 0
             errorMessage = nil
             refreshArtwork(for: track)
         } catch {
             errorMessage = "Unable to play \(track.url.lastPathComponent): \(error.localizedDescription)"
+        }
+    }
+
+    private static func buildAlbumGroups(from tracks: [Track], sortedBy sortOption: LibrarySortOption) -> [AlbumGroup] {
+        let grouped = Dictionary(grouping: tracks) { track in
+            AlbumArtworkIdentity.normalizedKey(artist: track.artist, album: track.album)
+        }
+
+        let groups = grouped.values.compactMap { albumTracks -> AlbumGroup? in
+            guard !albumTracks.isEmpty else { return nil }
+            let sortedTracks = albumTracks.sorted { lhs, rhs in
+                let leftNumber = lhs.trackNumber ?? Int.max
+                let rightNumber = rhs.trackNumber ?? Int.max
+                if leftNumber != rightNumber { return leftNumber < rightNumber }
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+            let representative = sortedTracks[0]
+            return AlbumGroup(
+                artist: representative.artist,
+                album: representative.album,
+                tracks: sortedTracks
+            )
+        }
+
+        return groups.sorted { lhs, rhs in
+            switch sortOption {
+            case .artist:
+                if lhs.artist != rhs.artist {
+                    return lhs.artist.localizedCaseInsensitiveCompare(rhs.artist) == .orderedAscending
+                }
+                return lhs.album.localizedCaseInsensitiveCompare(rhs.album) == .orderedAscending
+            case .album, .title, .genre:
+                return lhs.album.localizedCaseInsensitiveCompare(rhs.album) == .orderedAscending
+            }
         }
     }
 
@@ -910,12 +1169,19 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         let query = normalizedSearchQuery
         guard !query.isEmpty else {
             filteredPlaylist = playlist
+            refreshCachedAlbumGroups()
             return
         }
 
         filteredPlaylist = playlist.filter { track in
             trackMatchesSearch(track, query: query)
         }
+        refreshCachedAlbumGroups()
+    }
+
+    private func refreshCachedAlbumGroups() {
+        let tracks = hasActiveSearch ? filteredPlaylist : playlist
+        cachedAlbumGroups = Self.buildAlbumGroups(from: tracks, sortedBy: sortOption)
     }
 
     private func trackMatchesSearch(_ track: Track, query: String) -> Bool {
@@ -945,6 +1211,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         } else if currentIndex == nil || !playlist.indices.contains(currentIndex ?? -1) {
             currentIndex = 0
         }
+        refreshCachedAlbumGroups()
     }
 
     private func sortedTracks(_ tracks: [Track]) -> [Track] {
@@ -988,46 +1255,21 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func refreshLibrarySharingSnapshotIfNeeded() {
         guard isSharingLibrary else { return }
-        let tracks = libraryCatalog
         let roots = libraryRoots
         Task { [librarySharingService] in
-            await librarySharingService.updateSharedLibrary(tracks: tracks, roots: roots)
-            let snapshot = await librarySharingService.sharingTransferSnapshot()
-            await MainActor.run {
-                self.sharingTransferSnapshot = snapshot
-                self.updateLibrarySharingStatusLine()
+            do {
+                try await librarySharingService.updateSharedLibrary(roots: roots)
+                let snapshot = await librarySharingService.sharingTransferSnapshot()
+                await MainActor.run {
+                    self.sharingTransferSnapshot = snapshot
+                    self.updateLibrarySharingStatusLine()
+                }
+            } catch {
+                await MainActor.run {
+                    self.errorMessage = "Could not refresh library sharing: \(error.localizedDescription)"
+                }
             }
         }
-    }
-
-    private func pollSharingTransferState() {
-        guard isSharingLibrary else { return }
-        Task { [librarySharingService] in
-            let snapshot = await librarySharingService.sharingTransferSnapshot()
-            await MainActor.run {
-                self.sharingTransferSnapshot = snapshot
-                self.updateLibrarySharingStatusLine()
-            }
-        }
-    }
-
-    private func startSharingTransferPolling() {
-        sharingTransferTimer?.invalidate()
-        sharingTransferTimer = Timer.scheduledTimer(
-            withTimeInterval: 0.6,
-            repeats: true
-        ) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in
-                self.pollSharingTransferState()
-            }
-        }
-        pollSharingTransferState()
-    }
-
-    private func stopSharingTransferPolling() {
-        sharingTransferTimer?.invalidate()
-        sharingTransferTimer = nil
     }
 
     private func updateLibrarySharingStatusLine() {
@@ -1036,15 +1278,11 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             return
         }
 
-        let currentlyServing = sharingTransferSnapshot.current.count
-        let served = sharingTransferSnapshot.completed.count
-        let total = sharingTransferSnapshot.completed.count
-            + sharingTransferSnapshot.current.count
-            + sharingTransferSnapshot.upcoming.count
-        if currentlyServing > 0 {
-            librarySharingStatus = "Sharing \(total) tracks on \(librarySharingAddress) (\(served) served, \(currentlyServing) serving now)"
+        let moduleCount = sharingTransferSnapshot.upcoming.count
+        if moduleCount > 0 {
+            librarySharingStatus = "Sharing \(moduleCount) library folder\(moduleCount == 1 ? "" : "s") at \(librarySharingAddress)"
         } else {
-            librarySharingStatus = "Sharing \(total) tracks on \(librarySharingAddress) (\(served) served)"
+            librarySharingStatus = "Sharing library at \(librarySharingAddress)"
         }
     }
 
@@ -1222,11 +1460,11 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         guard !sentNowPlayingForCurrentTrackLoad,
               let credentials = lastFMCredentials,
               let track = currentTrack,
-              let audioPlayer
+              playbackEngine.hasLoadedTrack
         else { return }
 
         sentNowPlayingForCurrentTrackLoad = true
-        let trackDuration = audioPlayer.duration
+        let trackDuration = playbackEngine.duration
 
         Task { [lastFMScrobbler] in
             do {
@@ -1248,10 +1486,10 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
               let credentials = lastFMCredentials,
               let track = currentTrack,
               let startedAt = playbackStartedAtForCurrentTrack,
-              let audioPlayer
+              playbackEngine.hasLoadedTrack
         else { return }
 
-        let trackDuration = max(audioPlayer.duration, 0)
+        let trackDuration = max(playbackEngine.duration, 0)
         let threshold = max(30, min(trackDuration * 0.5, 240))
         guard listenedSecondsThisTrack >= threshold else { return }
 
@@ -1273,7 +1511,7 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     @objc private func refreshProgress() {
-        guard let audioPlayer else { return }
+        guard playbackEngine.hasLoadedTrack else { return }
 
         let now = Date()
         if let anchor = playbackTickAnchor {
@@ -1282,8 +1520,8 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
         playbackTickAnchor = now
 
-        currentTime = audioPlayer.currentTime
-        duration = max(audioPlayer.duration, 1)
+        currentTime = playbackEngine.currentTime
+        duration = max(playbackEngine.duration, 1)
         submitScrobbleIfEligible()
     }
 
@@ -1323,6 +1561,12 @@ final class PlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 forceFullRebuild = true
                 indexStatus = "Metadata index upgraded; rebuilding library"
             }
+        }
+
+        let youtubeRoot = await youtubeDownloadService.downloadRootURL()
+        let youtubePath = FilePathNormalization.canonical(youtubeRoot.path)
+        if FileManager.default.fileExists(atPath: youtubePath) {
+            ensureYouTubeLibraryRoot(youtubePath)
         }
 
         scheduleReindex(reason: "Checking for library changes", forceFullRebuild: forceFullRebuild)

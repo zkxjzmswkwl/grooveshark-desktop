@@ -34,6 +34,22 @@ struct LibraryGroup: Identifiable {
     let tracks: [Track]
 }
 
+struct AlbumGroup: Identifiable, Hashable {
+    var id: String { AlbumArtworkIdentity.normalizedKey(artist: artist, album: album) }
+    let artist: String
+    let album: String
+    let tracks: [Track]
+
+    var representativeTrack: Track {
+        tracks.min { lhs, rhs in
+            let leftNumber = lhs.trackNumber ?? Int.max
+            let rightNumber = rhs.trackNumber ?? Int.max
+            if leftNumber != rightNumber { return leftNumber < rightNumber }
+            return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        } ?? tracks[0]
+    }
+}
+
 struct SavedPlaylist: Identifiable, Codable, Equatable {
     let id: UUID
     var name: String
