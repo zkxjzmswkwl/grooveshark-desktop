@@ -43,27 +43,89 @@ enum YouTubeDownloadError: LocalizedError {
     }
 }
 
-actor YouTubeDownloadService {
+/// `yt-dlp` downloads spawn a child process and stream progress for the full (often multi-minute)
+/// duration of each download. All of that blocking process/pipe work runs on a dedicated GCD queue
+/// instead of the Swift concurrency cooperative thread pool, and progress is delivered back to the
+/// async caller through an `AsyncStream` so the UI never blocks.
+final class YouTubeDownloadService: @unchecked Sendable {
     static let downloadFolderName = "YouTube"
 
     private let fileManager = FileManager.default
+    /// Serial queue that owns each download's process lifecycle so it never ties up a
+    /// cooperative-pool thread for the duration of the download.
+    private let workQueue = DispatchQueue(label: "com.grooveshark.youtube-download.work", qos: .utility)
+    /// Used to drain a child process's stderr concurrently with its stdout, avoiding a pipe-buffer deadlock.
+    private let drainQueue = DispatchQueue(label: "com.grooveshark.youtube-download.drain", qos: .utility)
 
-    func downloadRootURL() -> URL {
-        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
-        return appSupport
-            .appendingPathComponent("GrooveShark", isDirectory: true)
-            .appendingPathComponent(Self.downloadFolderName, isDirectory: true)
+    func downloadRootURL() async -> URL {
+        rootURL()
     }
 
-    func isYTDLPAvailable() -> Bool {
-        resolveYTDLPExecutable() != nil
+    func isYTDLPAvailable() async -> Bool {
+        // Run on a global queue (not workQueue) so this quick check isn't blocked behind an
+        // in-flight, possibly multi-minute, download.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: self.resolveYTDLPExecutable() != nil)
+            }
+        }
     }
 
     func download(
         urls: [String],
         progress: (@Sendable (YouTubeDownloadProgressUpdate) async -> Void)? = nil
     ) async throws -> YouTubeDownloadResult {
+        let stream = AsyncStream<DownloadEvent> { continuation in
+            workQueue.async {
+                do {
+                    let result = try self.performDownload(urls: urls) { update in
+                        continuation.yield(.progress(update))
+                    }
+                    continuation.yield(.completed(result))
+                } catch {
+                    continuation.yield(.failed(error.localizedDescription))
+                }
+                continuation.finish()
+            }
+        }
+
+        // Forward buffered progress updates to the caller (which hops to the main actor for UI),
+        // then surface the final result once the background work has finished.
+        var result: YouTubeDownloadResult?
+        var failureMessage: String?
+        for await event in stream {
+            switch event {
+            case let .progress(update):
+                await progress?(update)
+            case let .completed(value):
+                result = value
+            case let .failed(message):
+                failureMessage = message
+            }
+        }
+
+        if let result {
+            return result
+        }
+        throw YouTubeDownloadError.downloadFailed(failureMessage ?? "Download ended unexpectedly.")
+    }
+
+    private enum DownloadEvent: Sendable {
+        case progress(YouTubeDownloadProgressUpdate)
+        case completed(YouTubeDownloadResult)
+        case failed(String)
+    }
+
+    /// Collects a child process's full stderr text while it is drained on a background queue,
+    /// so the error message is still available after the pipe has been consumed.
+    private final class StderrCollector: @unchecked Sendable {
+        var text = ""
+    }
+
+    private func performDownload(
+        urls: [String],
+        emit: @escaping @Sendable (YouTubeDownloadProgressUpdate) -> Void
+    ) throws -> YouTubeDownloadResult {
         guard let ytdlp = resolveYTDLPExecutable() else {
             throw YouTubeDownloadError.ytdlpNotFound
         }
@@ -73,7 +135,7 @@ actor YouTubeDownloadService {
             throw YouTubeDownloadError.invalidURL("(empty)")
         }
 
-        let root = downloadRootURL()
+        let root = rootURL()
         try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
 
         var downloadedFiles: [URL] = []
@@ -81,7 +143,7 @@ actor YouTubeDownloadService {
         var failureCount = 0
 
         for url in normalizedURLs {
-            await progress?(YouTubeDownloadProgressUpdate(
+            emit(YouTubeDownloadProgressUpdate(
                 url: url,
                 title: url,
                 phase: .queued,
@@ -92,7 +154,7 @@ actor YouTubeDownloadService {
 
             do {
                 let startedAt = Date()
-                let outcome = try await downloadSingle(url: url, ytdlp: ytdlp, root: root, progress: progress)
+                let outcome = try downloadSingle(url: url, ytdlp: ytdlp, root: root, emit: emit)
                 switch outcome {
                 case let .downloaded(primaryPath):
                     let newFiles = newlyDownloadedFiles(in: root, since: startedAt.addingTimeInterval(-2))
@@ -106,7 +168,7 @@ actor YouTubeDownloadService {
                 }
             } catch {
                 failureCount += 1
-                await progress?(YouTubeDownloadProgressUpdate(
+                emit(YouTubeDownloadProgressUpdate(
                     url: url,
                     title: url,
                     phase: .failed,
@@ -128,6 +190,14 @@ actor YouTubeDownloadService {
         )
     }
 
+    private func rootURL() -> URL {
+        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
+        return appSupport
+            .appendingPathComponent("GrooveShark", isDirectory: true)
+            .appendingPathComponent(Self.downloadFolderName, isDirectory: true)
+    }
+
     private enum SingleDownloadOutcome {
         case downloaded(primaryPath: String?)
         case skipped
@@ -137,11 +207,11 @@ actor YouTubeDownloadService {
         url: String,
         ytdlp: String,
         root: URL,
-        progress: (@Sendable (YouTubeDownloadProgressUpdate) async -> Void)?
-    ) async throws -> SingleDownloadOutcome {
-        let title = try await fetchTitle(url: url, ytdlp: ytdlp)
+        emit: @escaping @Sendable (YouTubeDownloadProgressUpdate) -> Void
+    ) throws -> SingleDownloadOutcome {
+        let title = try fetchTitle(url: url, ytdlp: ytdlp)
 
-        await progress?(YouTubeDownloadProgressUpdate(
+        emit(YouTubeDownloadProgressUpdate(
             url: url,
             title: title,
             phase: .downloading,
@@ -175,29 +245,37 @@ actor YouTubeDownloadService {
 
         try process.run()
 
-        async let stderrTask: Void = consumeProgressLines(
-            from: stderrPipe,
-            url: url,
-            title: title,
-            progress: progress
-        )
+        // Drain stderr (progress) on a separate queue so its pipe buffer can't fill and deadlock
+        // yt-dlp while we block reading stdout on this queue.
+        nonisolated(unsafe) let stderrHandle = stderrPipe.fileHandleForReading
+        let stderrCollector = StderrCollector()
+        let drainGroup = DispatchGroup()
+        drainGroup.enter()
+        drainQueue.async {
+            stderrCollector.text = self.consumeProgressLines(
+                from: stderrHandle,
+                url: url,
+                title: title,
+                emit: emit
+            )
+            drainGroup.leave()
+        }
 
         let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        await stderrTask
+        drainGroup.wait()
 
         let stdout = String(data: stdoutData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         guard process.terminationStatus == 0 else {
-            let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let message = stderr?.isEmpty == false ? stderr! : "yt-dlp exited with status \(process.terminationStatus)"
+            let stderr = stderrCollector.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = stderr.isEmpty ? "yt-dlp exited with status \(process.terminationStatus)" : stderr
             throw YouTubeDownloadError.downloadFailed(message)
         }
 
         if stdout.isEmpty {
-            await progress?(YouTubeDownloadProgressUpdate(
+            emit(YouTubeDownloadProgressUpdate(
                 url: url,
                 title: title,
                 phase: .skipped,
@@ -213,7 +291,7 @@ actor YouTubeDownloadService {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        await progress?(YouTubeDownloadProgressUpdate(
+        emit(YouTubeDownloadProgressUpdate(
             url: url,
             title: title,
             phase: .completed,
@@ -244,7 +322,7 @@ actor YouTubeDownloadService {
         return files.sorted { $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending }
     }
 
-    private func fetchTitle(url: String, ytdlp: String) async throws -> String {
+    private func fetchTitle(url: String, ytdlp: String) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ytdlp)
         process.arguments = ["--print", "%(title)s", "--no-playlist", url]
@@ -267,19 +345,22 @@ actor YouTubeDownloadService {
         return title
     }
 
+    /// Reads progress lines from the process's stderr, emitting download progress, and returns the
+    /// full captured stderr text (used to build an error message if the process fails).
     private func consumeProgressLines(
-        from pipe: Pipe,
+        from handle: FileHandle,
         url: String,
         title: String,
-        progress: (@Sendable (YouTubeDownloadProgressUpdate) async -> Void)?
-    ) async {
-        let handle = pipe.fileHandleForReading
+        emit: @Sendable (YouTubeDownloadProgressUpdate) -> Void
+    ) -> String {
         var buffer = Data()
+        var captured = Data()
 
         while true {
             let chunk = handle.availableData
             if chunk.isEmpty { break }
             buffer.append(chunk)
+            captured.append(chunk)
 
             while let newlineIndex = buffer.firstIndex(of: 0x0A) {
                 let lineData = buffer[..<newlineIndex]
@@ -291,7 +372,7 @@ actor YouTubeDownloadService {
                 else { continue }
 
                 let fraction = Self.parseDownloadFraction(from: line)
-                await progress?(YouTubeDownloadProgressUpdate(
+                emit(YouTubeDownloadProgressUpdate(
                     url: url,
                     title: title,
                     phase: .downloading,
@@ -301,6 +382,8 @@ actor YouTubeDownloadService {
                 ))
             }
         }
+
+        return String(data: captured, encoding: .utf8) ?? ""
     }
 
     private func resolveYTDLPExecutable() -> String? {

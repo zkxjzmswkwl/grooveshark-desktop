@@ -2,22 +2,63 @@ import AVFoundation
 import CoreServices
 import Foundation
 
-actor LibraryIndexer {
+/// All filesystem scanning, metadata extraction (which spawns `metaflac` and reads tags
+/// synchronously), and index persistence run on dedicated GCD queues instead of the Swift
+/// concurrency cooperative thread pool, so a long library scan never blocks the main thread
+/// or starves other async work.
+final class LibraryIndexer: @unchecked Sendable {
     private let fileManager = FileManager.default
     private var highestSaveGeneration: UInt64 = 0
     private let audioExtensions: Set<String> = [
         "flac", "mp3", "m4a", "aac", "aiff", "aif", "wav", "alac", "ogg", "opus"
     ]
 
-    func loadIndex() -> LibraryIndex? {
+    /// Serial queue for reading/writing the on-disk index. Serializing here keeps the
+    /// `highestSaveGeneration` guard correct and prevents concurrent writes to the JSON file.
+    private let ioQueue = DispatchQueue(label: "com.grooveshark.library-index.io", qos: .utility)
+    /// Serial queue for the heavy scan/metadata work, kept separate so a long scan never
+    /// blocks a pending index save (or vice versa).
+    private let scanQueue = DispatchQueue(label: "com.grooveshark.library-index.scan", qos: .utility)
+
+    func loadIndex() async -> LibraryIndex? {
+        await withCheckedContinuation { continuation in
+            ioQueue.async {
+                continuation.resume(returning: self.performLoadIndex())
+            }
+        }
+    }
+
+    /// `generation` must increase whenever the in-memory index advances. Older generations are ignored
+    /// so concurrent `persistCurrentIndex` saves cannot roll the JSON file back to stale metadata.
+    func saveIndex(_ index: LibraryIndex, generation: UInt64) async {
+        await withCheckedContinuation { continuation in
+            ioQueue.async {
+                self.performSaveIndex(index, generation: generation)
+                continuation.resume()
+            }
+        }
+    }
+
+    func scan(rootPath: String, previousRoot: LibraryRootIndex?, forceFullRebuild: Bool = false) async -> LibraryScanOutcome {
+        await withCheckedContinuation { continuation in
+            scanQueue.async {
+                let outcome = self.performScan(
+                    rootPath: rootPath,
+                    previousRoot: previousRoot,
+                    forceFullRebuild: forceFullRebuild
+                )
+                continuation.resume(returning: outcome)
+            }
+        }
+    }
+
+    private func performLoadIndex() -> LibraryIndex? {
         let url = indexURL()
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(LibraryIndex.self, from: data)
     }
 
-    /// `generation` must increase whenever the in-memory index advances. Older generations are ignored
-    /// so concurrent `persistCurrentIndex` saves cannot roll the JSON file back to stale metadata.
-    func saveIndex(_ index: LibraryIndex, generation: UInt64) {
+    private func performSaveIndex(_ index: LibraryIndex, generation: UInt64) {
         guard generation >= highestSaveGeneration else { return }
         highestSaveGeneration = generation
 
@@ -31,7 +72,7 @@ actor LibraryIndexer {
         }
     }
 
-    func scan(rootPath: String, previousRoot: LibraryRootIndex?, forceFullRebuild: Bool = false) async -> LibraryScanOutcome {
+    private func performScan(rootPath: String, previousRoot: LibraryRootIndex?, forceFullRebuild: Bool) -> LibraryScanOutcome {
         let canonicalRoot = FilePathNormalization.canonical(rootPath)
         let rootURL = URL(fileURLWithPath: canonicalRoot)
         let fingerprint = buildFingerprint(for: rootURL)
@@ -45,7 +86,7 @@ actor LibraryIndexer {
         indexedTracks.reserveCapacity(files.count)
 
         for file in files {
-            let metadata = await extractMetadata(for: file)
+            let metadata = extractMetadata(for: file)
             indexedTracks.append(
                 IndexedTrack(
                     path: FilePathNormalization.canonical(file.path),
@@ -117,7 +158,7 @@ actor LibraryIndexer {
         return RootFingerprint(fileCount: fileCount, latestModificationTime: latestDate.timeIntervalSince1970)
     }
 
-    private func extractMetadata(for url: URL) async -> (
+    private func extractMetadata(for url: URL) -> (
         title: String,
         artist: String,
         album: String,
